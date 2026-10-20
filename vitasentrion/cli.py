@@ -8,7 +8,14 @@ import sys
 from pathlib import Path
 
 from vitasentrion import __version__
-from vitasentrion.guard import evaluate_hook_payload, reset_state, _default_state_file
+from vitasentrion.config import ConfigError, load_config
+from vitasentrion.guard import (
+    evaluate_hook_payload,
+    reset_state,
+    verify_events_chain,
+    _default_state_file,
+)
+from vitasentrion.models import Finding, Severity
 from vitasentrion.parsers import parse_trace
 from vitasentrion.reporters import render_scorecard
 from vitasentrion.rules import evaluate_trace
@@ -25,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_audit = subparsers.add_parser("audit", help="Audit an agent session transcript or event log")
     p_audit.add_argument("target", help="Path to transcript file (.jsonl or .json) or raw JSON string")
+    p_audit.add_argument("--config", default=None, help="Path to vitasentrion.toml (default: search target dir / repo root)")
     p_audit.add_argument("--fail-on", choices=["warn", "fail"], default="fail", help="Severity threshold for exit code 1")
     p_audit.add_argument("--format", choices=["console", "markdown", "json"], default="console")
     p_audit.set_defaults(func=cmd_audit)
@@ -32,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan = subparsers.add_parser("scan", help="Scan a git repository for agent vandalism and weakened tests")
     p_scan.add_argument("repo_path", nargs="?", default=".", help="Path to git repository (default: current dir)")
     p_scan.add_argument("--base", default=None, help="Base git ref for PR diff scanning (e.g. origin/main or HEAD~1)")
+    p_scan.add_argument("--config", default=None, help="Path to vitasentrion.toml (default: search repo dir / repo root)")
     p_scan.add_argument("--fail-on", choices=["warn", "fail"], default="fail", help="Severity threshold for exit code 1")
     p_scan.add_argument("--format", choices=["console", "markdown", "json"], default="console")
     p_scan.set_defaults(func=cmd_scan)
@@ -39,10 +48,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard = subparsers.add_parser("guard", help="Pre-tool hook guard reading JSON from stdin (Claude Code hook compatible)")
     p_guard.add_argument("--workspace", default=None, help="Workspace root directory")
     p_guard.add_argument("--state-file", default=None, help="Path to persistent state file")
+    p_guard.add_argument("--config", default=None, help="Path to vitasentrion.toml (default: search workspace dir / repo root)")
     p_guard.add_argument("--reset", action="store_true", help="Delete the loop-breaker state file and exit (0)")
     p_guard.set_defaults(func=cmd_guard)
 
     return parser
+
+
+def _load_cli_config(args, start_dir):
+    """Resolve --config / auto-discovery for a command (M8)."""
+    try:
+        return load_config(
+            path=Path(args.config) if args.config else None,
+            start_dir=start_dir,
+        )
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
 
 
 def cmd_audit(args) -> int:
@@ -64,7 +86,32 @@ def cmd_audit(args) -> int:
             print(f"Error: Target '{args.target}' does not exist and is not valid JSON.", file=sys.stderr)
             return 1
 
-    card = evaluate_trace(trace)
+    cfg = _load_cli_config(args, Path(target_str).parent if is_file else Path.cwd())
+    if cfg is None:
+        return 1
+    card = evaluate_trace(trace, config=cfg)
+    # M7 (P1-a): an events JSONL written by the guard carries a hash
+    # chain; verify it and fold any tamper finding into the scorecard.
+    if is_file and Path(target_str).suffix == ".jsonl":
+        chain_findings = verify_events_chain(Path(target_str))
+        # M8: [rules].R8 = "warn" downgrades, "ignore" skips the check.
+        from vitasentrion.config import effective_rule_severity
+        kept = []
+        for f in chain_findings:
+            sev = effective_rule_severity(cfg, "R8", f.severity)
+            if sev is None:
+                continue
+            if sev is not f.severity:
+                f = Finding(rule_id=f.rule_id, rule_name=f.rule_name,
+                            severity=sev, message=f.message,
+                            details=f.details)
+            kept.append(f)
+        card.findings.extend(kept)
+        card.fail_count += sum(1 for f in kept if f.severity is Severity.FAIL)
+        card.warn_count += sum(1 for f in kept if f.severity is Severity.WARN)
+        if kept and card.verdict is Severity.PASS:
+            card.verdict = (Severity.FAIL
+                            if card.fail_count else Severity.WARN)
     print(render_scorecard(card, fmt=args.format))
 
     if args.fail_on == "warn":
@@ -78,7 +125,10 @@ def cmd_scan(args) -> int:
     if res.returncode != 0:
         raise RuntimeError(f"'{repo}' is not inside a git repository.")
 
-    card = audit_git_repo(repo, base_ref=args.base)
+    cfg = _load_cli_config(args, repo)
+    if cfg is None:
+        return 1
+    card = audit_git_repo(repo, base_ref=args.base, config=cfg)
     print(render_scorecard(card, fmt=args.format))
 
     if args.fail_on == "warn":
@@ -108,7 +158,12 @@ def cmd_guard(args) -> int:
         sys.stderr.write(f"VitaSentrion: invalid JSON on stdin: {e}\n")
         return 2
 
-    allowed, reason, findings = evaluate_hook_payload(payload, state_file=state_path, workspace_root=ws_root)
+    cfg = _load_cli_config(args, ws_root)
+    if cfg is None:
+        return 1
+    allowed, reason, findings = evaluate_hook_payload(
+        payload, state_file=state_path, workspace_root=ws_root, config=cfg
+    )
     if allowed:
         return 0
     else:

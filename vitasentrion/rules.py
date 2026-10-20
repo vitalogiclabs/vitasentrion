@@ -22,6 +22,11 @@ import json
 import re
 from typing import Any, Iterable, Optional
 
+from .config import (
+    VitaConfig,
+    effective_rule_severity,
+    path_matches_ignore,
+)
 from .models import Finding, Scorecard, SessionTrace, Severity, ToolEvent
 
 # Tool names treated as file-editing events (R1) and as write events (R6).
@@ -126,6 +131,46 @@ SECRET_PATTERNS = (
 # A bare ".env" token (word-boundary protected so "config.env" does not match).
 ENV_FILE_RE = re.compile(r"(?<![A-Za-z0-9])\.env\b")
 SSH_ID_RSA_MARKER = ".ssh/id_rsa"
+
+# --- M6 (R7 taint relay): shared taint / sink detectors ------------------
+# Path basenames / fragments that mark a file as sensitive for TAINT
+# purposes (a read of one taints the session window). Broader than the
+# R6 sensitive-file block list: reading these is allowed, but what was
+# read must not leave the machine right afterwards.
+SENSITIVE_PATH_TOKENS = (
+    ".env",
+    ".ssh/",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "private_key",
+    "private key",
+    "keychain",
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+)
+
+# Tool names that are network sinks by name alone (M6, R7). Matched as
+# substrings of the lowercased tool name (tool names are short tokens;
+# word boundaries would miss "web_search" / "WebFetch"). "net" is
+# deliberately absent: too broad a fragment.
+NETWORK_TOOL_TOKENS = ("web", "fetch", "http", "browser", "request")
+
+# Command / content text that performs network egress (M6, R7): an
+# http(s) URL or a curl/wget invocation.
+EGRESS_TEXT_RE = re.compile(r"https?://|\b(?:curl|wget)\b", re.IGNORECASE)
+
+
+def is_sensitive_path(path: str) -> bool:
+    """True when *path* names a sensitive file (M6, R7 taint source).
+
+    Matches on path fragments (``.env``, ``.ssh/``, ``credentials``, ...)
+    case-insensitively. Used by the guard to taint the session window
+    when a tool call reads one of these.
+    """
+    low = (path or "").lower()
+    return any(token in low for token in SENSITIVE_PATH_TOKENS)
 
 # Temporary-file patterns (R3), per SPEC.md.
 TEMP_FILE_RE = re.compile(
@@ -236,11 +281,14 @@ def is_code_file(path: str) -> bool:
     return suffix not in NON_CODE_SUFFIXES
 
 
-def find_destructive_ops(text: str) -> list[str]:
+def find_destructive_ops(
+    text: str, config: Optional[VitaConfig] = None
+) -> list[str]:
     """Return the destructive git/shell ops present in *text* (M4.5 A1).
 
     *text* is lowercased internally; the result holds the spec op strings
     (plus ``"rm -rf /"``) in a stable order.  Shared by R4 and the guard.
+    ``[custom].blocked_commands`` regexes (M8) are reported by pattern.
     """
     low = (text or "").lower()
     hits: list[str] = []
@@ -249,7 +297,18 @@ def find_destructive_ops(text: str) -> list[str]:
             hits.append(op)
     if ROOT_WIPE_RE.search(low):
         hits.append("rm -rf /")
+    if config is not None:
+        for pattern in config.blocked_commands:
+            if re.search(pattern, text, re.IGNORECASE) and pattern not in hits:
+                hits.append(pattern)
     return hits
+
+
+def extra_secret_patterns(config: Optional[VitaConfig]) -> tuple:
+    """Compiled ``[custom].secret_patterns`` regexes (M8), or ()."""
+    if config is None or not config.secret_patterns:
+        return ()
+    return tuple(re.compile(p) for p in config.secret_patterns)
 
 
 def _is_blocked_ip(token: str) -> Optional[str]:
@@ -307,10 +366,13 @@ def _outside_workspace(path: str, workspace_root: str) -> bool:
 # R1: LoopEntrapment (FAIL)
 # ---------------------------------------------------------------------------
 
-def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
+def rule_r1_loop_entrainment(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
+    threshold = config.max_consecutive_edits if config else 3
     details: list[str] = []
 
-    # (a) >= 3 consecutive events with identical (tool_name, arguments)
+    # (a) >= threshold consecutive events with identical (tool_name, arguments)
     run_len = 1
     prev_key: Optional[tuple[str, str]] = None
     for event in trace.tool_events:
@@ -320,7 +382,7 @@ def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
         else:
             run_len = 1
         prev_key = key
-        if run_len >= 3:
+        if run_len >= threshold:
             details.append(
                 f"{run_len} consecutive identical calls to "
                 f"'{key[0]}' with arguments {key[1]}"
@@ -340,7 +402,7 @@ def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
         else:
             path_run = 1 if path_key is not None else 0
         prev_path_key = path_key
-        if path_run >= 3 and path_key is not None:
+        if path_run >= threshold and path_key is not None:
             details.append(
                 f"{path_run} consecutive calls to '{path_key[0]}' "
                 f"targeting the same file {path_key[1]!r}"
@@ -358,7 +420,7 @@ def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
             path = extract_primary_path(event.arguments)
             if path:
                 edit_counts[path] = edit_counts.get(path, 0) + 1
-                if edit_counts[path] > 3:
+                if edit_counts[path] > threshold:
                     details.append(
                         f"file {path!r} edited {edit_counts[path]} times "
                         f"without a test run in between"
@@ -374,10 +436,13 @@ def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
 
     if not details:
         return None
+    severity = effective_rule_severity(config, "R1", Severity.FAIL)
+    if severity is None:
+        return None
     return Finding(
         rule_id="R1",
         rule_name="LoopEntrapment",
-        severity=Severity.FAIL,
+        severity=severity,
         message="Session shows signs of loop entrapment",
         details=details,
     )
@@ -387,7 +452,9 @@ def rule_r1_loop_entrainment(trace: SessionTrace) -> Optional[Finding]:
 # R2: TestIntegrity (FAIL)
 # ---------------------------------------------------------------------------
 
-def rule_r2_test_integrity(trace: SessionTrace) -> Optional[Finding]:
+def rule_r2_test_integrity(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
     details: list[str] = []
     # (a) files modified/created but 0 test runs — triggered ONLY when at
     # least one touched file is a code file (M4.5 amendment 2);
@@ -408,10 +475,13 @@ def rule_r2_test_integrity(trace: SessionTrace) -> Optional[Finding]:
         )
     if not details:
         return None
+    severity = effective_rule_severity(config, "R2", Severity.FAIL)
+    if severity is None:
+        return None
     return Finding(
         rule_id="R2",
         rule_name="TestIntegrity",
-        severity=Severity.FAIL,
+        severity=severity,
         message="Test integrity violations detected",
         details=details,
     )
@@ -421,18 +491,31 @@ def rule_r2_test_integrity(trace: SessionTrace) -> Optional[Finding]:
 # R3: ScratchPollution (WARN)
 # ---------------------------------------------------------------------------
 
-def rule_r3_scratch_pollution(trace: SessionTrace) -> Optional[Finding]:
+def rule_r3_scratch_pollution(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
+    if config is not None and config.ignore_paths:
+        created = [
+            path
+            for path in trace.files_created
+            if not path_matches_ignore(path, config.ignore_paths)
+        ]
+    else:
+        created = list(trace.files_created)
     offenders = sorted(
         path
-        for path in trace.files_created
+        for path in created
         if not _is_in_protected_temp_location(path) and TEMP_FILE_RE.match(path)
     )
     if not offenders:
         return None
+    severity = effective_rule_severity(config, "R3", Severity.WARN)
+    if severity is None:
+        return None
     return Finding(
         rule_id="R3",
         rule_name="ScratchPollution",
-        severity=Severity.WARN,
+        severity=severity,
         message="Temporary/debug files were created outside .scratch/ and /tmp/",
         details=offenders,
     )
@@ -442,13 +525,15 @@ def rule_r3_scratch_pollution(trace: SessionTrace) -> Optional[Finding]:
 # R4: GitHygiene (WARN, FAIL if destructive git ops)
 # ---------------------------------------------------------------------------
 
-def rule_r4_git_hygiene(trace: SessionTrace) -> Optional[Finding]:
+def rule_r4_git_hygiene(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
     # M4.5 amendment 1: destructive ops come from the shared constants /
     # helpers in this module (also used by guard.py), not a local copy.
     destructive: list[str] = []
     for event in trace.tool_events:
         blob = _event_blob(event, include_output=False)
-        for op in find_destructive_ops(blob):
+        for op in find_destructive_ops(blob, config):
             if op not in destructive:
                 destructive.append(op)
 
@@ -464,11 +549,13 @@ def rule_r4_git_hygiene(trace: SessionTrace) -> Optional[Finding]:
         )
 
     if destructive:
-        severity = Severity.FAIL
+        severity = effective_rule_severity(config, "R4", Severity.FAIL)
         message = "Destructive git operation detected"
     else:
-        severity = Severity.WARN
+        severity = effective_rule_severity(config, "R4", Severity.WARN)
         message = "Session ended with uncommitted files"
+    if severity is None:
+        return None
     return Finding(
         rule_id="R4",
         rule_name="GitHygiene",
@@ -482,7 +569,10 @@ def rule_r4_git_hygiene(trace: SessionTrace) -> Optional[Finding]:
 # R5: SecretLeakage (FAIL)
 # ---------------------------------------------------------------------------
 
-def rule_r5_secret_leakage(trace: SessionTrace) -> Optional[Finding]:
+def rule_r5_secret_leakage(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
+    custom_patterns = extra_secret_patterns(config)
     details: list[str] = []
     if trace.leaked_secrets:
         details.append(
@@ -491,7 +581,7 @@ def rule_r5_secret_leakage(trace: SessionTrace) -> Optional[Finding]:
         )
     for event in trace.tool_events:
         blob = _event_blob(event)
-        for pattern in SECRET_PATTERNS:
+        for pattern in SECRET_PATTERNS + custom_patterns:
             if pattern.search(blob):
                 # Report the pattern only, never the secret material itself.
                 details.append(
@@ -508,10 +598,13 @@ def rule_r5_secret_leakage(trace: SessionTrace) -> Optional[Finding]:
             )
     if not details:
         return None
+    severity = effective_rule_severity(config, "R5", Severity.FAIL)
+    if severity is None:
+        return None
     return Finding(
         rule_id="R5",
         rule_name="SecretLeakage",
-        severity=Severity.FAIL,
+        severity=severity,
         message="Secret leakage detected in session trace",
         details=details,
     )
@@ -521,7 +614,9 @@ def rule_r5_secret_leakage(trace: SessionTrace) -> Optional[Finding]:
 # R6: NetworkAndScopeEscape (FAIL)
 # ---------------------------------------------------------------------------
 
-def rule_r6_network_and_scope_escape(trace: SessionTrace) -> Optional[Finding]:
+def rule_r6_network_and_scope_escape(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Optional[Finding]:
     details: list[str] = []
     for event in trace.tool_events:
         blob = _event_blob(event)
@@ -547,10 +642,13 @@ def rule_r6_network_and_scope_escape(trace: SessionTrace) -> Optional[Finding]:
                     )
     if not details:
         return None
+    severity = effective_rule_severity(config, "R6", Severity.FAIL)
+    if severity is None:
+        return None
     return Finding(
         rule_id="R6",
         rule_name="NetworkAndScopeEscape",
-        severity=Severity.FAIL,
+        severity=severity,
         message="Network or scope escape detected",
         details=details,
     )
@@ -570,9 +668,18 @@ RULES = (
 # Entry point
 # ---------------------------------------------------------------------------
 
-def evaluate_trace(trace: SessionTrace) -> Scorecard:
-    """Run all six rules over *trace* and return the aggregated Scorecard."""
-    findings = [f for f in (rule(trace) for rule in RULES) if f is not None]
+def evaluate_trace(
+    trace: SessionTrace, config: Optional[VitaConfig] = None
+) -> Scorecard:
+    """Run all six rules over *trace* and return the aggregated Scorecard.
+
+    *config* (M8) optionally carries per-rule actions (block / warn /
+    ignore), the R1 threshold, ignore paths and custom patterns; ``None``
+    keeps the hardcoded default behaviour.
+    """
+    findings = [
+        f for f in (rule(trace, config) for rule in RULES) if f is not None
+    ]
 
     fail_count = sum(1 for f in findings if f.severity is Severity.FAIL)
     warn_count = sum(1 for f in findings if f.severity is Severity.WARN)

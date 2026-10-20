@@ -17,6 +17,10 @@ subset a guard can see from a single invocation:
   file path (content / line arguments may differ) also trips.
 - ``R5`` SecretLeakage (M4.5 amendment 4) — a call whose command /
   content material matches a secret pattern is blocked before it runs.
+- ``R7`` TaintRelay (M6) — a sensitive-file read inside the remembered
+  window taints the session; any network egress (web/fetch/http tool,
+  http(s) URL, curl/wget) inside that window is blocked, so freshly-read
+  credentials cannot leave the machine.
 
 The hook is format-agnostic: it understands Claude Code ``PreToolUse``
 payloads (``tool_name`` / ``tool_input``), Cline-style payloads (where
@@ -48,17 +52,28 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .models import Finding, Severity
+from .config import (
+    DEFAULT_STATE_TTL_SECONDS,
+    VitaConfig,
+    path_matches_ignore,
+    rule_action,
+)
 from .rules import (
     BLOCKED_IP_NETS,
     DESTRUCTIVE_GIT_OPS,
+    EGRESS_TEXT_RE,
     ENV_FILE_RE,
+    NETWORK_TOOL_TOKENS,
     PIPE_TO_SHELL_RE,
     ROOT_WIPE_RE,
     SECRET_PATTERNS,
+    SENSITIVE_PATH_TOKENS,
     SSH_ID_RSA_MARKER,
     extract_primary_path,
+    extra_secret_patterns,
     find_destructive_ops,
     find_network_hits,
+    is_sensitive_path,
 )
 
 __all__ = [
@@ -75,6 +90,9 @@ __all__ = [
     "_default_state_file",
     "_canonical_args_json",
     "_iter_path_values",
+    "_is_tainted_call",
+    "_is_egress_call",
+    "verify_events_chain",
 ]
 
 # Backwards-compatible alias (M4 named it DESTRUCTIVE_GIT_COMMANDS; M4.5
@@ -105,10 +123,10 @@ _SCAN_ARG_KEYS = frozenset(
     )
 )
 
-# State entry shape: [tool_name, canonical_args_json, primary_path].
-# The run length is derived from consecutive entries, never stored, so
-# the persisted state stays a plain JSON *list* of 3-tuples (M4 contract;
-# test_guard.test_state_persisted_across_calls pins this shape).
+# State entry shape: [tool_name, canonical_args_json, primary_path,
+# tainted 0|1]. The run length is derived from consecutive entries, never
+# stored, so the persisted state stays a plain JSON *list* of 4-tuples
+# (M6 grew the shape from 3 to 4; 3-tuples load as untainted).
 _MAX_REMEMBERED = 5
 
 # Loop-breaker state older than this (by the state file's mtime, which
@@ -220,6 +238,36 @@ def _call_text(args: dict) -> str:
     return "\n".join(parts)
 
 
+def _is_tainted_call(name: str, args: dict, path: str) -> bool:
+    """M6 (R7): does this call read sensitive material?
+
+    Taint sources: a primary path argument naming a sensitive file
+    (``read_file path=".env"`` — R6 does not block these reads), or any
+    path argument / command text touching a sensitive-file token.
+    """
+    if is_sensitive_path(path):
+        return True
+    for value in _iter_path_values(args):
+        if is_sensitive_path(value):
+            return True
+    text = _call_text(args).lower()
+    return any(token in text for token in SENSITIVE_PATH_TOKENS)
+
+
+def _is_egress_call(name: str, args: dict) -> bool:
+    """M6 (R7): does this call send data over the network?
+
+    Sink by tool name (web / fetch / http / browser / request) or by
+    command text (http(s) URL, curl / wget). Private / link-local /
+    ssh targets are already blocked by R6; R7 catches the public egress
+    R6 lets through.
+    """
+    low_name = name.lower()
+    if any(token in low_name for token in NETWORK_TOOL_TOKENS):
+        return True
+    return bool(EGRESS_TEXT_RE.search(_call_text(args)))
+
+
 def _check_destructive(text: str) -> list[str]:
     """Destructive git/shell ops present in *text* (shared, M4.5 A1)."""
     return find_destructive_ops(text)
@@ -272,11 +320,37 @@ def _scope_escape_paths(args: dict, root: str) -> list[str]:
     return escapes
 
 
-def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Finding]]:
+def _apply_rule_action(
+    config: Optional[VitaConfig], rule_id: str, finding: Finding
+) -> Optional[Finding]:
+    """Honor a [rules] action for a guard finding (M8).
+
+    ``ignore`` drops the finding; ``warn`` downgrades it to WARN, which
+    lets the call through (only FAIL findings block the guard).
+    """
+    action = rule_action(config, rule_id)
+    if action == "ignore":
+        return None
+    if action == "warn" and finding.severity is not Severity.WARN:
+        return Finding(
+            rule_id=finding.rule_id,
+            rule_name=finding.rule_name,
+            severity=Severity.WARN,
+            message=finding.message,
+            details=finding.details,
+        )
+    return finding
+
+
+def _evaluate_one(
+    name: str, args: dict, root: str, config: Optional[VitaConfig] = None
+) -> tuple[bool, str, list[Finding]]:
     """Run the R4 / R5 / R6 checks for one normalised call.
 
     All checks run and their findings are combined, so a single call can
-    report both (e.g. ``sudo rm -rf /`` -> R4 *and* R6).
+    report both (e.g. ``sudo rm -rf /`` -> R4 *and* R6).  *config* (M8)
+    optionally extends the command/secret patterns and applies per-rule
+    actions (block / warn / ignore).
     """
     text = _call_text(args)
     text_low = text.lower()
@@ -286,8 +360,13 @@ def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Fin
 
     # --- R4: destructive commands (shared detection, M4.5 A1) -------------
     ops = _check_destructive(text_low)
+    # [custom].blocked_commands regexes extend R4 (M8).
+    for pattern in config.blocked_commands if config else ():
+        if re.search(pattern, text, re.IGNORECASE):
+            ops.append(pattern)
     if ops:
-        findings.append(
+        finding = _apply_rule_action(
+            config, "R4",
             Finding(
                 rule_id="R4",
                 rule_name="GitHygiene",
@@ -297,9 +376,11 @@ def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Fin
                     f"tool '{name}' contains destructive op '{op}'"
                     for op in ops
                 ],
-            )
+            ),
         )
-        reasons.append("destructive command")
+        if finding is not None:
+            findings.append(finding)
+            reasons.append("destructive command")
 
     # --- R5: secret leakage (M4.5 A4) -------------------------------------
     # A secret being *written or echoed* by this call is blocked before it
@@ -307,9 +388,14 @@ def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Fin
     # argument (command, new_string, content, ...) are caught.  Only the
     # pattern is reported, never the secret material itself.
     args_blob = _canonical_args_json(args)
-    secret_hits = [p.pattern for p in SECRET_PATTERNS if p.search(args_blob)]
+    secret_hits = [
+        p.pattern
+        for p in SECRET_PATTERNS + extra_secret_patterns(config)
+        if p.search(args_blob)
+    ]
     if secret_hits:
-        findings.append(
+        finding = _apply_rule_action(
+            config, "R5",
             Finding(
                 rule_id="R5",
                 rule_name="SecretLeakage",
@@ -319,9 +405,11 @@ def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Fin
                     f"tool '{name}' argument matches secret pattern {pat!r}"
                     for pat in secret_hits
                 ],
-            )
+            ),
         )
-        reasons.append("secret leakage in arguments")
+        if finding is not None:
+            findings.append(finding)
+            reasons.append("secret leakage in arguments")
 
     # --- R6: network / scope escapes --------------------------------------
     r6_details: list[str] = []
@@ -350,21 +438,26 @@ def _evaluate_one(name: str, args: dict, root: str) -> tuple[bool, str, list[Fin
     )
 
     if r6_details:
-        findings.append(
+        finding = _apply_rule_action(
+            config, "R6",
             Finding(
                 rule_id="R6",
                 rule_name="NetworkAndScopeEscape",
                 severity=Severity.FAIL,
                 message="Network / scope escape blocked",
                 details=r6_details,
-            )
+            ),
         )
-        reasons.append("network/scope escape")
+        if finding is not None:
+            findings.append(finding)
+            reasons.append("network/scope escape")
 
-    if findings:
+    # M8: a [rules] action of "warn" keeps the finding but downgrades it
+    # to WARN; only FAIL findings block the call.
+    if any(f.severity is Severity.FAIL for f in findings):
         return False, "; ".join(reasons), findings
 
-    return True, "Allowed", []
+    return True, "Allowed", findings
 
 
 def _load_state(state_file: Path) -> list:
@@ -428,6 +521,90 @@ def _run_length(entries: list, name: str, args_json: str, path: str) -> int:
     return length
 
 
+def _chain_hash(prev_hash: str, body: dict) -> str:
+    """M7 (P1-a): SHA-256 over prev_hash + canonical line content.
+
+    The hash covers everything except the ``prev_hash`` / ``hash``
+    fields themselves, so a verifier can recompute it from the line.
+    """
+    content = json.dumps(
+        {k: v for k, v in body.items() if k not in ("prev_hash", "hash")},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256((prev_hash + content).encode("utf-8")).hexdigest()
+
+
+def _last_chain_hash(events: Path) -> str:
+    """Hash of the last line of the events log ('0'*64 if none)."""
+    try:
+        with events.open("rb") as fh:
+            fh.seek(0, 2)
+            pos, chunk = fh.tell(), b""
+            while pos > 0 and b"\n" not in chunk:
+                step = min(65536, pos)
+                pos -= step
+                fh.seek(pos)
+                chunk = fh.read(step) + chunk
+            last = chunk.rstrip(b"\n").split(b"\n")[-1] if chunk.strip() else b""
+        if last:
+            return str(json.loads(last).get("hash") or "") or "0" * 64
+    except (OSError, ValueError):
+        pass
+    return "0" * 64
+
+
+def verify_events_chain(events_file: Path) -> list[Finding]:
+    """M7 (P1-a): verify the hash chain of an events JSONL log.
+
+    Returns [] for a clean chain, else one R8 EventsChainTampered
+    finding listing every broken link (missing/invalid chain fields,
+    content modified, or a line deleted — each line's prev_hash must
+    equal the previous line's hash).
+    """
+    problems: list[str] = []
+    prev = "0" * 64
+    try:
+        lines = events_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return [
+            Finding(
+                rule_id="R8",
+                rule_name="EventsChainTampered",
+                severity=Severity.FAIL,
+                message=f"Events log unreadable: {exc}",
+            )
+        ]
+    for i, raw in enumerate(lines, start=1):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            problems.append(f"line {i}: not valid JSON")
+            continue
+        claimed, got_prev = obj.get("hash"), obj.get("prev_hash")
+        if got_prev != prev:
+            problems.append(
+                f"line {i}: prev_hash mismatch (line deleted or reordered)"
+            )
+        recomputed = _chain_hash(str(got_prev or ""), obj)
+        if claimed != recomputed:
+            problems.append(f"line {i}: content modified (hash mismatch)")
+        prev = str(claimed) if isinstance(claimed, str) and claimed else "0" * 64
+    if not problems:
+        return []
+    return [
+        Finding(
+            rule_id="R8",
+            rule_name="EventsChainTampered",
+            severity=Severity.FAIL,
+            message=f"Events log hash chain broken ({len(problems)} problem(s))",
+            details=problems[:20],
+        )
+    ]
+
+
 def _append_event(
     state_file: Path,
     *,
@@ -473,6 +650,8 @@ def _append_event(
             except OSError:
                 events.unlink(missing_ok=True)
         with events.open("a", encoding="utf-8") as fh:
+            line["prev_hash"] = _last_chain_hash(events)
+            line["hash"] = _chain_hash(line["prev_hash"], line)
             fh.write(json.dumps(line, default=str) + "\n")
     except OSError:
         pass
@@ -483,6 +662,7 @@ def evaluate_hook_payload(
     *,
     workspace_root: Optional[str] = None,
     state_file: Optional[Path] = None,
+    config: Optional[VitaConfig] = None,
 ) -> tuple[bool, str, list[Finding]]:
     """Evaluate one tool-call payload against the guard rules.
 
@@ -499,6 +679,11 @@ def evaluate_hook_payload(
     state_file:
         Where the stateful loop-breaker run is persisted.  Defaults to a
         sha256-keyed file in the system temp dir (never inside the repo).
+    config:
+        Optional :class:`~vitasentrion.config.VitaConfig` (M8): overrides
+        the loop threshold, state TTL, ignore paths, per-rule actions and
+        custom command/secret patterns.  ``None`` keeps the hardcoded
+        default behaviour.
 
     Returns
     -------
@@ -514,8 +699,20 @@ def evaluate_hook_payload(
     root = _workspace_root_for(payload, workspace_root)
     sf = Path(state_file) if state_file else _default_state_file(root)
 
+    # --- [guard].ignore_paths: skip checks, still log the event (M8) -----
+    if config is not None and config.ignore_paths:
+        ignored_path = _primary_path(args)
+        if ignored_path and path_matches_ignore(
+            ignored_path, config.ignore_paths
+        ):
+            _append_event(
+                sf, name=name, args=args, root=root,
+                allowed=True, reason="Allowed (ignored path)",
+            )
+            return True, "Allowed (ignored path)", []
+
     # --- R4 / R5 / R6 checks ----------------------------------------------
-    allowed, reason, findings = _evaluate_one(name, args, root)
+    allowed, reason, findings = _evaluate_one(name, args, root, config)
 
     # Record the evaluated event as ground-truth JSONL (M4.5 A4).
     _append_event(
@@ -541,7 +738,8 @@ def evaluate_hook_payload(
         sf_mtime = sf.stat().st_mtime
     except OSError:
         pass
-    stale = sf_mtime is not None and (time.time() - sf_mtime) > STATE_TTL_SECONDS
+    ttl = config.state_ttl_seconds if config else STATE_TTL_SECONDS
+    stale = sf_mtime is not None and (time.time() - sf_mtime) > ttl
     entries = [] if stale else _load_state(sf)
     if not stale:
         # Keep an *active* run alive for the full TTL regardless of how the
@@ -557,27 +755,76 @@ def evaluate_hook_payload(
     args_json = _canonical_args_json(args)
     path = _primary_path(args)
 
-    length = _run_length(entries, name, args_json, path) + 1
-    if length >= 3:
-        # Stay blocked: do NOT append, so the persisted run keeps counting
-        # and further identical calls stay blocked.
-        return (
-            False,
-            LOOP_BREAKER_MESSAGE,
-            [
-                Finding(
-                    rule_id="R1",
-                    rule_name="LoopEntrapment",
-                    severity=Severity.FAIL,
-                    message="Repeated identical call blocked",
-                    details=[
-                        f"tool '{name}' invoked {length} times in a row "
-                        f"with identical arguments"
-                        + (f" on path {path!r}" if path else "")
-                    ],
-                )
-            ],
+    # --- R7: taint relay (M6) ----------------------------------------------
+    # A sensitive read inside the remembered window taints the session:
+    # any network egress inside that window is blocked, so freshly-read
+    # secrets/credentials cannot leave the machine (CaMeL-style control,
+    # PLAN.md M6). A blocked egress does NOT append to state, so the
+    # taint stays until it ages out of the window or reset_state clears
+    # the file.
+    if _is_egress_call(name, args):
+        tainted_at = next(
+            (
+                i
+                for i, entry in enumerate(entries)
+                if isinstance(entry, list) and len(entry) > 3 and entry[3]
+            ),
+            None,
         )
+        if tainted_at is not None:
+            source = entries[tainted_at][0] if entries[tainted_at] else "unknown"
+            finding = _apply_rule_action(
+                config, "R7",
+                Finding(
+                    rule_id="R7",
+                    rule_name="TaintRelay",
+                    severity=Severity.FAIL,
+                    message="Network egress blocked after sensitive read",
+                    details=[
+                        f"tool '{name}' would send data out while the "
+                        f"session window still contains a sensitive read "
+                        f"(source tool '{source}')"
+                    ],
+                ),
+            )
+            if finding is not None and finding.severity is Severity.FAIL:
+                return False, "taint relay", [finding]
 
-    _save_state(sf, entries + [[name, args_json, path]])
-    return True, "Allowed", []
+    length = _run_length(entries, name, args_json, path) + 1
+    threshold = config.max_consecutive_edits if config else 3
+    if length >= threshold:
+        finding = _apply_rule_action(
+            config, "R1",
+            Finding(
+                rule_id="R1",
+                rule_name="LoopEntrapment",
+                severity=Severity.FAIL,
+                message="Repeated identical call blocked",
+                details=[
+                    f"tool '{name}' invoked {length} times in a row "
+                    f"with identical arguments"
+                    + (f" on path {path!r}" if path else "")
+                ],
+            ),
+        )
+        if finding is not None and finding.severity is Severity.FAIL:
+            # Stay blocked: do NOT append, so the persisted run keeps
+            # counting and further identical calls stay blocked.
+            return False, LOOP_BREAKER_MESSAGE, [finding]
+        if finding is not None:
+            # M8 "warn": allow the call but report the WARN finding.
+            _save_state(
+                sf,
+                entries
+                + [[name, args_json, path,
+                    int(_is_tainted_call(name, args, path))]],
+            )
+            return True, "Allowed", findings + [finding]
+
+    _save_state(
+        sf,
+        entries + [[name, args_json, path, int(_is_tainted_call(name, args, path))]],
+    )
+    # M8: a [rules] "warn" action keeps findings at WARN severity; the
+    # call is allowed but the caller still receives them.
+    return True, "Allowed", findings

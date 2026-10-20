@@ -12,3 +12,4 @@ venv/
 *.events.jsonl*
 .tools/
 .pytest_cache/
+.scratch/

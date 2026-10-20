@@ -29,7 +29,8 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 
-from .models import Scorecard, SessionTrace
+from .config import VitaConfig, path_matches_ignore, rule_action
+from .models import Finding, Scorecard, SessionTrace, Severity
 from .rules import evaluate_trace
 
 # ---------------------------------------------------------------------------
@@ -307,6 +308,145 @@ def _parse_diff(output: str) -> Tuple[int, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# R9: repo-borne prompt injection (M9, P1-b)
+# ---------------------------------------------------------------------------
+
+# Instruction / prompt files an agent may later read as instructions.
+INSTRUCTION_BASENAMES = {
+    "agents.md", "claude.md", "gemini.md", ".cursorrules",
+}
+INSTRUCTION_NAME_MARKERS = ("prompt", "instruction")
+# Suffixes that mark instruction content on their own (.prompt, .rules);
+# .md/.txt only match through the name rules below.
+INSTRUCTION_OWN_SUFFIXES = (".prompt", ".rules")
+INSTRUCTION_DOC_SUFFIXES = {".md", ".markdown"}
+
+# Detector 1: prompt-injection / instruction-override signatures.
+OVERRIDE_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("override-phrase", re.compile(
+        r"ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?",
+        re.IGNORECASE)),
+    ("override-phrase", re.compile(
+        r"disregard\s+(?:all\s+|any\s+|the\s+)?"
+        r"(?:previous|prior|above|system)\s+"
+        r"(?:instructions?|prompts?|rules?)",
+        re.IGNORECASE)),
+    ("override-phrase", re.compile(
+        r"forget\s+(?:all\s+)?(?:previous|prior|your)\s+instructions?",
+        re.IGNORECASE)),
+    ("override-phrase", re.compile(
+        r"override\s+(?:all\s+)?(?:previous|prior|the\s+system|system)\s+"
+        r"(?:instructions?|prompts?|rules?)",
+        re.IGNORECASE)),
+    ("override-phrase", re.compile(
+        r"new\s+instructions?\s*:", re.IGNORECASE)),
+)
+
+# Detector 2: hidden-Unicode tricks (zero-width chars, BOM, bidi
+# override/clear) that hide text from a human reviewer but not a model.
+HIDDEN_UNICODE_RE = re.compile("[\u200b\u200c\u200d\ufeff\u202e\u202c]")
+
+# Detector 3: base64-shaped payload blobs (48+ chars) inside an
+# instruction file — the classic smuggled-payload marker.
+BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{48,}={0,2}")
+
+# Files larger than this are not read for R9 (instruction files are small;
+# a huge match is almost certainly generated data).
+_INSTRUCTION_MAX_BYTES = 512 * 1024
+
+
+def is_instruction_file(path: str) -> bool:
+    """True when *path* (repo-relative, '/' separators) is an instruction /
+    prompt file that R9 scans (M9, P1-b).
+
+    Matches well-known agent instruction basenames (AGENTS.md, CLAUDE.md,
+    GEMINI.md, .cursorrules), ``*.prompt`` / ``*rules`` files, filenames
+    containing "prompt" or "instruction" with a text suffix, and any
+    Markdown under ``.github/`` (issue templates, Copilot instructions).
+    """
+    normalized = path.replace("\\", "/")
+    parts = [seg for seg in normalized.split("/") if seg]
+    if not parts:
+        return False
+    name = parts[-1]
+    low = name.lower()
+    if low in INSTRUCTION_BASENAMES or low.endswith(INSTRUCTION_OWN_SUFFIXES):
+        return True
+    if any(marker in low for marker in INSTRUCTION_NAME_MARKERS):
+        # name marker + a text suffix; code files like prompt_loader.py
+        # are not instruction files.
+        return low.endswith((".md", ".markdown", ".txt", ".prompt"))
+    if ".github" in parts[:-1] and low.endswith(
+        tuple(INSTRUCTION_DOC_SUFFIXES)
+    ):
+        return True
+    return False
+
+
+def detect_repo_injections(
+    repo_path, config: Optional[VitaConfig] = None
+) -> List[Finding]:
+    """Scan instruction files in *repo_path* for planted prompt-injection
+    payloads (M9, R9). Returns zero or one R9 (RepoInjection) finding.
+
+    Walks the working tree (skipping ``.git/``), keeps only
+    :func:`is_instruction_file` matches, drops ``[guard].ignore_paths``
+    (M8) before reading, and reports file + detector + line number per
+    hit — never the line content, so the report cannot echo the payload.
+    """
+    root = Path(repo_path).resolve()
+    hits: List[str] = []
+    for candidate in sorted(root.rglob("*")):
+        if not candidate.is_file():
+            continue
+        rel = candidate.relative_to(root).as_posix()
+        if rel.startswith(".git/") or rel == ".git":
+            continue
+        if config is not None and config.ignore_paths and path_matches_ignore(
+            rel, config.ignore_paths
+        ):
+            continue
+        if not is_instruction_file(rel):
+            continue
+        try:
+            if candidate.stat().st_size > _INSTRUCTION_MAX_BYTES:
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in OVERRIDE_PATTERNS:
+                if pattern.search(line):
+                    hits.append(
+                        f"{rel}:{lineno}: instruction-override phrase "
+                        f"({label})"
+                    )
+            if HIDDEN_UNICODE_RE.search(line):
+                hits.append(
+                    f"{rel}:{lineno}: hidden Unicode character "
+                    "(zero-width / bidi)"
+                )
+            if BASE64_BLOB_RE.search(line):
+                hits.append(
+                    f"{rel}:{lineno}: base64-shaped payload blob"
+                )
+    if not hits:
+        return []
+    return [
+        Finding(
+            rule_id="R9",
+            rule_name="RepoInjection",
+            severity=Severity.WARN,
+            message=(
+                f"Instruction files contain prompt-injection markers "
+                f"({len(hits)} hit(s))"
+            ),
+            details=hits[:20],
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Scratch-file detection
 # ---------------------------------------------------------------------------
 
@@ -329,7 +469,24 @@ def detect_scratch_files(created: Iterable[str]) -> Set[str]:
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def scan_git_repo(repo_path, base_ref: Optional[str] = None) -> SessionTrace:
+def _drop_ignored(
+    paths: Set[str], config: Optional[VitaConfig]
+) -> Set[str]:
+    """Remove paths matching ``[guard].ignore_paths`` (M8)."""
+    if config is None or not config.ignore_paths:
+        return paths
+    return {
+        path
+        for path in paths
+        if not path_matches_ignore(path, config.ignore_paths)
+    }
+
+
+def scan_git_repo(
+    repo_path,
+    base_ref: Optional[str] = None,
+    config: Optional[VitaConfig] = None,
+) -> SessionTrace:
     """Scan a git repository and build a :class:`SessionTrace`.
 
     Steps:
@@ -352,6 +509,9 @@ def scan_git_repo(repo_path, base_ref: Optional[str] = None) -> SessionTrace:
     scratch files.  This is how CI Pull Requests get their *committed*
     changes scanned, not just the dirty worktree.
 
+    *config* (M8) optionally carries ``[guard].ignore_paths``: matching
+    paths are dropped from every reported set (and never secret-scanned).
+
     Raises
     ------
     RuntimeError
@@ -366,6 +526,11 @@ def scan_git_repo(repo_path, base_ref: Optional[str] = None) -> SessionTrace:
             f"git status failed for {root}: {status.stderr.strip()}"
         )
     modified, created, uncommitted = _parse_porcelain(status.stdout)
+    modified, created, uncommitted = (
+        _drop_ignored(modified, config),
+        _drop_ignored(created, config),
+        _drop_ignored(uncommitted, config),
+    )
 
     diff = _run_git(["diff"], root)
     if diff.returncode == 0:
@@ -398,8 +563,8 @@ def scan_git_repo(repo_path, base_ref: Optional[str] = None) -> SessionTrace:
                 f"{root}: {status_base.stderr.strip()}"
             )
         base_modified, base_created = _parse_name_status(status_base.stdout)
-        modified |= base_modified
-        created |= base_created
+        modified |= _drop_ignored(base_modified, config)
+        created |= _drop_ignored(base_created, config)
 
     # ``git diff`` (without --cached) does not show the content of untracked
     # files, so scan every newly created path on disk and merge any secrets
@@ -429,11 +594,46 @@ def scan_git_repo(repo_path, base_ref: Optional[str] = None) -> SessionTrace:
     )
 
 
-def audit_git_repo(repo_path, base_ref: Optional[str] = None) -> Scorecard:
+def audit_git_repo(
+    repo_path,
+    base_ref: Optional[str] = None,
+    config: Optional[VitaConfig] = None,
+) -> Scorecard:
     """Scan *repo_path* and return the rule-engine :class:`Scorecard`.
 
     *base_ref* is forwarded to :func:`scan_git_repo` (M4.5 amendment 5):
     when provided, committed changes against the base ref are scanned too.
+    *config* (M8) is forwarded for ignore-path filtering and rule actions.
     """
-    trace = scan_git_repo(repo_path, base_ref=base_ref)
-    return evaluate_trace(trace)
+    trace = scan_git_repo(repo_path, base_ref=base_ref, config=config)
+    card = evaluate_trace(trace, config=config)
+
+    # M9 (P1-b): fold the repo-borne injection scan into the scorecard.
+    # R9's DEFAULT action is "warn" (docs discussing prompts must not
+    # hard-block); [rules] R9 = "block" escalates to FAIL, "ignore"
+    # skips the check entirely.
+    r9_action = rule_action(config, "R9", default="warn")
+    if r9_action != "ignore":
+        r9 = detect_repo_injections(repo_path, config=config)
+        if r9 and r9_action == "block":
+            r9 = [
+                Finding(
+                    rule_id=f.rule_id, rule_name=f.rule_name,
+                    severity=Severity.FAIL, message=f.message,
+                    details=f.details,
+                )
+                for f in r9
+            ]
+        card.findings.extend(r9)
+        card.fail_count += sum(
+            1 for f in r9 if f.severity is Severity.FAIL
+        )
+        card.warn_count += sum(
+            1 for f in r9 if f.severity is Severity.WARN
+        )
+        if r9:
+            if card.fail_count:
+                card.verdict = Severity.FAIL
+            elif card.verdict is Severity.PASS:
+                card.verdict = Severity.WARN
+    return card

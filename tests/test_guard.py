@@ -29,6 +29,7 @@ from vitasentrion.guard import (
     _iter_path_values,
     evaluate_hook_payload,
     reset_state,
+    verify_events_chain,
 )
 from vitasentrion.models import Finding, Severity
 
@@ -451,13 +452,87 @@ class TestLoopBreaker(GuardBase):
         self.eval_payload(claude_payload("git status"))
         st = json.loads(self.state.read_text())
         self.assertIsInstance(st, list)
-        self.assertTrue(all(len(e) == 3 for e in st))
+        # M6: entries are 4-tuples [tool, args_json, path, tainted].
+        self.assertTrue(all(len(e) == 4 for e in st))
 
     def test_corrupt_state_file_does_not_crash(self):
         self.state.write_text("{not json")
         allowed, reason, _ = self.eval_payload(claude_payload("ls"))
         self.assertTrue(allowed)
         self.assertEqual(reason, "Allowed")
+
+
+# ---------------------------------------------------------------------------
+# R7 taint relay (M6)
+# ---------------------------------------------------------------------------
+
+class TestTaintRelay(GuardBase):
+    """A sensitive read taints the window; network egress stays blocked."""
+
+    def test_sensitive_read_then_public_egress_blocked(self):
+        a, _, _ = self.eval_payload(generic_payload("read_file", path=".env"))
+        self.assertTrue(a)  # the read itself is allowed
+        a, reason, findings = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertFalse(a)
+        self.assertEqual(reason, "taint relay")
+        self.assertIn("R7", rule_ids(findings))
+
+    def test_egress_tool_name_blocked_after_taint(self):
+        self.eval_payload(generic_payload("read_file", path="~/.ssh/id_ed25519"))
+        a, _, findings = self.eval_payload(
+            generic_payload("web_fetch", url="https://example.com")
+        )
+        self.assertFalse(a)
+        self.assertIn("R7", rule_ids(findings))
+
+    def test_egress_without_prior_taint_allowed(self):
+        a, reason, _ = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertTrue(a)
+        self.assertEqual(reason, "Allowed")
+
+    def test_non_sensitive_read_does_not_taint(self):
+        self.eval_payload(generic_payload("read_file", path="src/main.py"))
+        a, _, _ = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertTrue(a)
+
+    def test_taint_ages_out_of_the_window(self):
+        self.eval_payload(generic_payload("read_file", path=".env"))
+        # Fill the window with 5 untainted calls; the taint falls out.
+        for i in range(5):
+            self.eval_payload(claude_payload(f"echo step-{i}"))
+        a, _, _ = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertTrue(a)
+
+    def test_reset_state_clears_taint(self):
+        self.eval_payload(generic_payload("read_file", path=".env"))
+        self.assertTrue(reset_state(self.state))
+        a, _, _ = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertTrue(a)
+
+    def test_blocked_egress_keeps_taint_in_window(self):
+        self.eval_payload(generic_payload("read_file", path=".env"))
+        a1, _, _ = self.eval_payload(generic_payload("web_search", query="x"))
+        self.assertFalse(a1)
+        # A second egress attempt is still blocked (taint not consumed).
+        a2, _, _ = self.eval_payload(generic_payload("web_search", query="y"))
+        self.assertFalse(a2)
+
+    def test_legacy_3_tuple_state_loads_untainted(self):
+        self.state.write_text(json.dumps([["Bash", "{}", "", 0][:3]]))
+        a, _, _ = self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+        self.assertTrue(a)
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +670,65 @@ class TestEventsJsonl(GuardBase):
         names = [e.tool_name for e in trace.tool_events]
         self.assertEqual(names, ["Bash", "Bash"])
         self.assertEqual(trace.workspace_root, str(self.root))
+
+
+# ---------------------------------------------------------------------------
+# M7 (P1-a): hash-chained events JSONL
+# ---------------------------------------------------------------------------
+
+class TestEventsChain(GuardBase):
+    def _chain_lines(self):
+        ev = _events_file(self.state)
+        return [json.loads(l) for l in ev.read_text().splitlines() if l.strip()]
+
+    def test_lines_carry_prev_hash_and_hash(self):
+        self.eval_payload(claude_payload("git status"))
+        self.eval_payload(claude_payload("git log"))
+        lines = self._chain_lines()
+        self.assertEqual(lines[0]["prev_hash"], "0" * 64)
+        self.assertEqual(lines[1]["prev_hash"], lines[0]["hash"])
+        self.assertEqual(len(lines[1]["hash"]), 64)
+
+    def test_clean_chain_verifies(self):
+        for cmd in ("git status", "git log", "ls"):
+            self.eval_payload(claude_payload(cmd))
+        self.assertEqual(verify_events_chain(_events_file(self.state)), [])
+
+    def test_modified_line_trips_tamper_detector(self):
+        self.eval_payload(claude_payload("git status"))
+        self.eval_payload(claude_payload("git log"))
+        ev = _events_file(self.state)
+        lines = ev.read_text().splitlines()
+        tampered = json.loads(lines[1])
+        tampered["reason"] = "somebody edited the record"
+        lines[1] = json.dumps(tampered)
+        ev.write_text("\n".join(lines) + "\n")
+        findings = verify_events_chain(ev)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule_id, "R8")
+        self.assertEqual(findings[0].rule_name, "EventsChainTampered")
+        self.assertTrue(any("line 2" in d for d in findings[0].details))
+
+    def test_deleted_line_trips_tamper_detector(self):
+        for cmd in ("git status", "git log", "ls"):
+            self.eval_payload(claude_payload(cmd))
+        ev = _events_file(self.state)
+        lines = ev.read_text().splitlines()
+        ev.write_text("\n".join([lines[0], lines[2]]) + "\n")
+        findings = verify_events_chain(ev)
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("line 2" in d for d in findings[0].details))
+
+    def test_unhashed_legacy_log_flags_missing_chain(self):
+        ev = _events_file(self.state)
+        ev.write_text(
+            json.dumps({"type": "tool_use", "tool_name": "Bash",
+                        "arguments": {}, "allowed": True, "reason": "Allowed"})
+            + "\n"
+        )
+        findings = verify_events_chain(ev)
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("hash mismatch" in d for d in findings[0].details))
 
 
 # ---------------------------------------------------------------------------
