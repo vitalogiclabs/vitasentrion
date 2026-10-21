@@ -253,3 +253,64 @@ line content (keeps reports short, avoids echoing the payload).
 - [x] m9.4: docs (SPEC.md section 5, README.md) + full suite + commit
       (382 tests, October, 20, 2026)
 
+
+# M10 — P2-a Secret Redaction Mode (rules.py / guard.py / config.py)
+
+Source: research/vitasentrion-comparison/rapor-claude-codex-round2.md,
+P2-a (openafw pattern: replace with placeholder instead of blocking).
+Owner-confirmed scope (October, 20, 2026): typed placeholders, guard
+allows with WARN, events.jsonl stores only redacted args, reports never
+show raw credentials. Stdlib regex substitution only.
+
+## Decision D1 — switches
+- Two config switches, either enables it: [guard] redact_secrets = true
+  (bool, validated) or [rules] R5 = "redact" (valid for R5 only; any
+  other rule with "redact" is a ConfigError). Single predicate:
+  config.redaction_enabled(). Default off = historical hard-block R5.
+
+## Decision D2 — placeholder + helper (rules.py)
+- REDACTED_TEMPLATE "[REDACTED:{token}]"; SECRET_TOKEN_TYPES maps the
+  five built-in pattern sources to OPENAI_KEY / ANTHROPIC_KEY / AWS_KEY
+  / GITHUB_TOKEN / PRIVATE_KEY; anything else (incl. [custom] patterns)
+  is GENERIC_SECRET.
+- redact_text(text, config) -> (redacted, token_types) applies
+  SECRET_PATTERNS in order; SECRET_PATTERNS reordered most-specific-
+  first (sk-ant before sk-) so Anthropic keys are typed correctly —
+  behaviour-neutral for detection, only detail text could change.
+- redact_args() recurses over argument mappings without mutating input.
+
+## Decision D3 — guard path
+- _evaluate_one: redaction on -> R5 finding is WARN with placeholder
+  details, call allowed (no "secret leakage" reason). R4/R6/R7/R1
+  unaffected.
+- _append_event takes config and stores redact_args(args) when on; the
+  loop-breaker state file's args_json is redacted too. Hash chain (M7)
+  computed over the redacted line -> verify_events_chain stays clean.
+
+## Decision D4 — audit/reporter path
+- rule_r5_secret_leakage redact mode: WARN; per-event details name the
+  placeholders; per leaked value reports the redacted form, falling back
+  to GENERIC_SECRET when no redaction pattern claims it (the scanner's
+  looser private-key marker). [rules] R5 = "ignore" still skips.
+- scan_git_repo unchanged: SessionTrace.leaked_secrets keeps raw values
+  (data source); masking happens at the reporting layer, so console/
+  markdown/json renderers never print credentials.
+
+## Files
+- vitasentrion/config.py (redact_secrets key, R5 "redact" action,
+  redaction_enabled())
+- vitasentrion/rules.py (SECRET_TOKEN_TYPES, redact_text, redact_args,
+  R5 rule redact mode, SECRET_PATTERNS order)
+- vitasentrion/guard.py (R5 redact path, _append_event config kwarg,
+  state-file args redaction)
+- tests/test_redaction.py (new)
+
+## Checklist
+- [x] m10.1: config switches + validation + redaction_enabled()
+- [x] m10.2: redaction helper + typed placeholders
+- [x] m10.3: guard path (allow + WARN, events/state sanitization,
+      chain intact)
+- [x] m10.4: audit path (finding masking, renderers clean)
+- [x] m10.5: unit tests (23 new)
+- [x] m10.6: docs (SPEC.md section 6, README.md) + full suite + commit
+      (405 tests, October, 20, 2026)

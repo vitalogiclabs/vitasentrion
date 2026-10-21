@@ -114,10 +114,12 @@ VitaSentrion works with zero configuration. To tune it, drop a `vitasentrion.tom
 max_consecutive_edits = 3      # R1 threshold (loop breaker + rules)
 state_ttl_seconds = 3600       # loop-breaker state TTL
 ignore_paths = [".scratch/*"]  # paths skipped by guard / scan
+redact_secrets = true          # R5: replace secrets with [REDACTED:<TYPE>] instead of blocking
 
 [rules]
 R3 = "warn"                    # per-rule action: block | warn | ignore
 R4 = "ignore"
+R5 = "redact"                  # same as redact_secrets, per-rule form
 R9 = "block"                   # repo injection scan: escalate warn -> fail
 
 [custom]
@@ -127,6 +129,7 @@ secret_patterns = ["hunter2{3,}"]                # extra R5 regexes
 
 - No config file = the built-in defaults, exactly as before.
 - `warn` downgrades a rule's finding (the guard lets WARN findings through); `ignore` disables the rule.
+- **Secret redaction mode** (`redact_secrets = true` or `R5 = "redact"`): instead of hard-blocking a tool call whose arguments contain a credential, the call is allowed with a WARN finding, and every secret is replaced with a typed placeholder — `[REDACTED:OPENAI_KEY]`, `[REDACTED:AWS_KEY]`, `[REDACTED:ANTHROPIC_KEY]`, `[REDACTED:GITHUB_TOKEN]`, `[REDACTED:PRIVATE_KEY]`, `[REDACTED:GENERIC_SECRET]`. The guard's `events.jsonl` audit log, its loop-breaker state file and all scorecard reports then contain only redacted snippets — plaintext credentials never hit disk.
 - Parsing uses stdlib `tomllib` (Python 3.11+); on 3.10 it uses `tomli` if installed, otherwise defaults apply with a warning. Unknown keys or invalid values fail loudly with an error.
 
 ## Rules Reference
@@ -135,7 +138,7 @@ secret_patterns = ["hunter2{3,}"]                # extra R5 regexes
 - R2 TestIntegrity: Modified code without tests, failing test runs, or deleted assertions.
 - R3 ScratchPollution: Temporary debug files left outside .scratch/.
 - R4 GitHygiene: Uncommitted changes or destructive git commands (reset --hard, clean -f).
-- R5 SecretLeakage: Leaked credentials (AWS, OpenAI, Anthropic, GitHub, Private Keys, .env).
+- R5 SecretLeakage: Leaked credentials (AWS, OpenAI, Anthropic, GitHub, Private Keys, .env). With redaction mode on (`redact_secrets = true` or `R5 = "redact"`), calls are allowed with a WARN finding and every secret becomes `[REDACTED:<TOKEN_TYPE>]` in the audit log and reports.
 - R6 NetworkScopeEscape: Private subnets (RFC1918), metadata IPs, and SSH port 22.
 - R7 TaintRelay: Network egress blocked while the session window still contains a sensitive-file read (live guard only).
 - R8 EventsChainTampered: The guard's events log is hash-chained (SHA-256); `audit` flags any modified or deleted line.

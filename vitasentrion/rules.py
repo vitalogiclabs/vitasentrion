@@ -26,6 +26,8 @@ from .config import (
     VitaConfig,
     effective_rule_severity,
     path_matches_ignore,
+    redaction_enabled,
+    rule_action,
 )
 from .models import Finding, Scorecard, SessionTrace, Severity, ToolEvent
 
@@ -121,8 +123,8 @@ SSH_PORT_RE = re.compile(r"(?<!\d):22(?!\d)")
 # (guard.py imports these). scanner.py keeps a deliberately separate, looser
 # private-key variant — see scanner.py SECRET_PATTERNS note.
 SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"ghp_[A-Za-z0-9]{20,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -309,6 +311,67 @@ def extra_secret_patterns(config: Optional[VitaConfig]) -> tuple:
     if config is None or not config.secret_patterns:
         return ()
     return tuple(re.compile(p) for p in config.secret_patterns)
+
+
+# --- M10 (P2-a): secret redaction ----------------------------------------
+# When redaction mode is on, matched secret material is replaced with a
+# typed placeholder instead of being echoed or blocked. The placeholder
+# never contains secret material; only the token TYPE is reported.
+REDACTED_TEMPLATE = "[REDACTED:{token}]"
+
+# Pattern source text -> token type. Patterns not listed here (the
+# [custom].secret_patterns regexes) are GENERIC_SECRET.
+SECRET_TOKEN_TYPES = {
+    r"sk-[A-Za-z0-9_-]{20,}": "OPENAI_KEY",
+    r"sk-ant-[A-Za-z0-9_-]{20,}": "ANTHROPIC_KEY",
+    r"AKIA[0-9A-Z]{16}": "AWS_KEY",
+    r"ghp_[A-Za-z0-9]{20,}": "GITHUB_TOKEN",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----": "PRIVATE_KEY",
+}
+
+
+def secret_token_type(pattern) -> str:
+    """Token type for a compiled or source secret pattern."""
+    src = getattr(pattern, "pattern", pattern)
+    return SECRET_TOKEN_TYPES.get(src, "GENERIC_SECRET")
+
+
+def redact_text(text: str, config: Optional[VitaConfig] = None):
+    """Replace secret matches in *text* with ``[REDACTED:<TOKEN_TYPE>]``.
+
+    Returns ``(redacted_text, token_types)`` where *token_types* lists
+    each distinct type once, in match order. Patterns are applied in
+    :data:`SECRET_PATTERNS` order (most specific first) so an
+    ``sk-ant-...`` token is claimed as ANTHROPIC_KEY, never as
+    OPENAI_KEY. Stdlib regex substitution only.
+    """
+    out = text or ""
+    types: list[str] = []
+    for pattern in SECRET_PATTERNS + extra_secret_patterns(config):
+        def _replace(match, _p=pattern):
+            token = secret_token_type(_p)
+            if token not in types:
+                types.append(token)
+            return REDACTED_TEMPLATE.format(token=token)
+
+        out = pattern.sub(_replace, out)
+    return out, types
+
+
+def redact_args(args, config: Optional[VitaConfig] = None):
+    """Deep copy of an arguments mapping with every string redacted (M10).
+
+    Used by the guard so ``events.jsonl`` and the loop-breaker state file
+    never contain plaintext credentials when redaction mode is on.
+    Non-string scalars are passed through unchanged.
+    """
+    if isinstance(args, str):
+        return redact_text(args, config)[0]
+    if isinstance(args, dict):
+        return {k: redact_args(v, config) for k, v in args.items()}
+    if isinstance(args, (list, tuple)):
+        return [redact_args(v, config) for v in args]
+    return args
 
 
 def _is_blocked_ip(token: str) -> Optional[str]:
@@ -572,22 +635,44 @@ def rule_r4_git_hygiene(
 def rule_r5_secret_leakage(
     trace: SessionTrace, config: Optional[VitaConfig] = None
 ) -> Optional[Finding]:
+    redact = redaction_enabled(config)
     custom_patterns = extra_secret_patterns(config)
     details: list[str] = []
     if trace.leaked_secrets:
-        details.append(
-            f"{len(trace.leaked_secrets)} secret(s) recorded as leaked in "
-            f"trace metadata"
-        )
+        if redact:
+            # M10: report the REDACTED form of each leaked secret, never
+            # the raw value, so scorecards stay free of credentials.
+            # The scanner's pattern set is deliberately looser than R5's
+            # (e.g. a private-key marker without the ----- framing); a
+            # value that no redaction pattern claims still gets a
+            # generic placeholder.
+            for secret in trace.leaked_secrets:
+                masked, types = redact_text(secret, config)
+                if not types:
+                    masked = REDACTED_TEMPLATE.format(token="GENERIC_SECRET")
+                details.append(f"leaked secret recorded as {masked}")
+        else:
+            details.append(
+                f"{len(trace.leaked_secrets)} secret(s) recorded as leaked in "
+                f"trace metadata"
+            )
     for event in trace.tool_events:
         blob = _event_blob(event)
-        for pattern in SECRET_PATTERNS + custom_patterns:
-            if pattern.search(blob):
-                # Report the pattern only, never the secret material itself.
+        if redact:
+            _, types = redact_text(blob, config)
+            for token in types:
                 details.append(
-                    f"event '{event.tool_name}' matches secret pattern "
-                    f"{pattern.pattern!r}"
+                    f"event '{event.tool_name}' secret redacted as "
+                    f"{REDACTED_TEMPLATE.format(token=token)}"
                 )
+        else:
+            for pattern in SECRET_PATTERNS + custom_patterns:
+                if pattern.search(blob):
+                    # Report the pattern only, never the secret material itself.
+                    details.append(
+                        f"event '{event.tool_name}' matches secret pattern "
+                        f"{pattern.pattern!r}"
+                    )
         if ENV_FILE_RE.search(blob):
             details.append(
                 f"event '{event.tool_name}' accesses a .env file"
@@ -598,9 +683,16 @@ def rule_r5_secret_leakage(
             )
     if not details:
         return None
-    severity = effective_rule_severity(config, "R5", Severity.FAIL)
-    if severity is None:
-        return None
+    if redact:
+        # M10: redaction mode never hard-blocks; findings are WARN with
+        # redacted snippets. An explicit [rules] R5 = "ignore" still skips.
+        if rule_action(config, "R5") == "ignore":
+            return None
+        severity = Severity.WARN
+    else:
+        severity = effective_rule_severity(config, "R5", Severity.FAIL)
+        if severity is None:
+            return None
     return Finding(
         rule_id="R5",
         rule_name="SecretLeakage",

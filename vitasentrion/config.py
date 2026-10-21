@@ -11,9 +11,11 @@ Schema (all keys optional)::
     max_consecutive_edits = 3      # R1 threshold (loop breaker + rules)
     state_ttl_seconds = 3600       # loop-breaker state TTL
     ignore_paths = [".scratch/*"]  # paths skipped by guard / scan
+    redact_secrets = false         # R5 redaction mode (M10, P2-a)
 
     [rules]
     R3 = "warn"                    # per-rule action: block | warn | ignore
+    R5 = "redact"                  # "redact" is valid for R5 only (M10)
 
     [custom]
     blocked_commands = []          # extra regexes treated as destructive (R4)
@@ -46,6 +48,7 @@ __all__ = [
     "find_config_file",
     "path_matches_ignore",
     "rule_action",
+    "redaction_enabled",
     "effective_rule_severity",
     "CONFIG_FILENAME",
     "RULE_IDS",
@@ -81,6 +84,7 @@ class VitaConfig:
     max_consecutive_edits: int = DEFAULT_MAX_CONSECUTIVE_EDITS
     state_ttl_seconds: int = DEFAULT_STATE_TTL_SECONDS
     ignore_paths: tuple[str, ...] = ()
+    redact_secrets: bool = False
     rule_actions: dict[str, str] = field(default_factory=dict)
     blocked_commands: tuple[str, ...] = ()
     secret_patterns: tuple[str, ...] = ()
@@ -157,7 +161,8 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
         raise ConfigError("[guard] must be a table")
     for key in guard:
         if key not in (
-            "max_consecutive_edits", "state_ttl_seconds", "ignore_paths"
+            "max_consecutive_edits", "state_ttl_seconds", "ignore_paths",
+            "redact_secrets",
         ):
             raise ConfigError(f"unknown key [guard].{key}")
     if "max_consecutive_edits" in guard:
@@ -172,6 +177,13 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
         cfg.ignore_paths = _require_str_list(
             "guard", "ignore_paths", guard["ignore_paths"]
         )
+    if "redact_secrets" in guard:
+        if not isinstance(guard["redact_secrets"], bool):
+            raise ConfigError(
+                "[guard].redact_secrets must be a boolean, got "
+                f"{guard['redact_secrets']!r}"
+            )
+        cfg.redact_secrets = guard["redact_secrets"]
 
     rules = data.get("rules", {})
     if not isinstance(rules, dict):
@@ -182,9 +194,12 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
                 f"unknown rule {rule_id!r} in [rules] "
                 f"(valid: {', '.join(RULE_IDS)})"
             )
-        if not isinstance(action, str) or action not in RULE_ACTIONS:
+        allowed_actions = RULE_ACTIONS + (
+            ("redact",) if rule_id == "R5" else ()
+        )
+        if not isinstance(action, str) or action not in allowed_actions:
             raise ConfigError(
-                f"[rules].{rule_id} must be one of {RULE_ACTIONS}, "
+                f"[rules].{rule_id} must be one of {allowed_actions}, "
                 f"got {action!r}"
             )
         cfg.rule_actions[rule_id] = action
@@ -306,6 +321,20 @@ def rule_action(
     if config is None:
         return default
     return config.rule_actions.get(rule_id, default)
+
+
+def redaction_enabled(config: Optional[VitaConfig]) -> bool:
+    """True when R5 secret redaction mode is on (M10, P2-a).
+
+    Either switch turns it on: ``[guard].redact_secrets = true`` or
+    ``[rules] R5 = "redact"``. With no config, redaction is off and R5
+    keeps its historical hard-block behaviour.
+    """
+    if config is None:
+        return False
+    return bool(config.redact_secrets) or (
+        config.rule_actions.get("R5") == "redact"
+    )
 
 
 def effective_rule_severity(

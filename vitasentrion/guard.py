@@ -56,6 +56,7 @@ from .config import (
     DEFAULT_STATE_TTL_SECONDS,
     VitaConfig,
     path_matches_ignore,
+    redaction_enabled,
     rule_action,
 )
 from .rules import (
@@ -65,6 +66,7 @@ from .rules import (
     ENV_FILE_RE,
     NETWORK_TOOL_TOKENS,
     PIPE_TO_SHELL_RE,
+    REDACTED_TEMPLATE,
     ROOT_WIPE_RE,
     SECRET_PATTERNS,
     SENSITIVE_PATH_TOKENS,
@@ -74,6 +76,8 @@ from .rules import (
     find_destructive_ops,
     find_network_hits,
     is_sensitive_path,
+    redact_args,
+    redact_text,
 )
 
 __all__ = [
@@ -387,29 +391,48 @@ def _evaluate_one(
     # runs: the full canonical argument blob is scanned so secrets in any
     # argument (command, new_string, content, ...) are caught.  Only the
     # pattern is reported, never the secret material itself.
+    # M10 (P2-a): with redaction mode on, the call is allowed and the
+    # finding is WARN with typed placeholders; the events log stores the
+    # redacted arguments (see _append_event).
     args_blob = _canonical_args_json(args)
-    secret_hits = [
-        p.pattern
-        for p in SECRET_PATTERNS + extra_secret_patterns(config)
-        if p.search(args_blob)
-    ]
-    if secret_hits:
-        finding = _apply_rule_action(
-            config, "R5",
-            Finding(
+    if redaction_enabled(config):
+        _, secret_types = redact_text(args_blob, config)
+        if secret_types:
+            finding = Finding(
                 rule_id="R5",
                 rule_name="SecretLeakage",
-                severity=Severity.FAIL,
-                message="Secret leakage blocked in tool arguments",
+                severity=Severity.WARN,
+                message="Secret redacted in tool arguments",
                 details=[
-                    f"tool '{name}' argument matches secret pattern {pat!r}"
-                    for pat in secret_hits
+                    f"tool '{name}' argument redacted as "
+                    f"{REDACTED_TEMPLATE.format(token=t)}"
+                    for t in secret_types
                 ],
-            ),
-        )
-        if finding is not None:
+            )
             findings.append(finding)
-            reasons.append("secret leakage in arguments")
+    else:
+        secret_hits = [
+            p.pattern
+            for p in SECRET_PATTERNS + extra_secret_patterns(config)
+            if p.search(args_blob)
+        ]
+        if secret_hits:
+            finding = _apply_rule_action(
+                config, "R5",
+                Finding(
+                    rule_id="R5",
+                    rule_name="SecretLeakage",
+                    severity=Severity.FAIL,
+                    message="Secret leakage blocked in tool arguments",
+                    details=[
+                        f"tool '{name}' argument matches secret pattern {pat!r}"
+                        for pat in secret_hits
+                    ],
+                ),
+            )
+            if finding is not None:
+                findings.append(finding)
+                reasons.append("secret leakage in arguments")
 
     # --- R6: network / scope escapes --------------------------------------
     r6_details: list[str] = []
@@ -613,6 +636,7 @@ def _append_event(
     root: str,
     allowed: bool,
     reason: str,
+    config: Optional[VitaConfig] = None,
 ) -> None:
     """Append one evaluated event as a Claude ``tool_use`` JSONL line (A4).
 
@@ -621,7 +645,13 @@ def _append_event(
     top-level ``tool_use`` lines, so the log is a first-class,
     natively-parsable trace source.  Recording is best-effort: a write
     error never blocks the hook.
+
+    M10 (P2-a): when redaction mode is on, the recorded *arguments* are
+    the redacted form — credentials never sit plaintext in the audit log.
     """
+    if redaction_enabled(config):
+        redacted = redact_args(args, config)
+        args = redacted if isinstance(redacted, dict) else {}
     line = {
         "type": "tool_use",
         "tool_name": name,
@@ -708,6 +738,7 @@ def evaluate_hook_payload(
             _append_event(
                 sf, name=name, args=args, root=root,
                 allowed=True, reason="Allowed (ignored path)",
+                config=config,
             )
             return True, "Allowed (ignored path)", []
 
@@ -722,6 +753,7 @@ def evaluate_hook_payload(
         root=root,
         allowed=allowed,
         reason=reason,
+        config=config,
     )
 
     # Destructive / network / secret blocks return before the loop
@@ -753,6 +785,12 @@ def evaluate_hook_payload(
         except OSError:
             pass
     args_json = _canonical_args_json(args)
+    # M10: with redaction mode on, the persisted loop-breaker state also
+    # carries only redacted arguments.
+    if redaction_enabled(config):
+        redacted = redact_args(args, config)
+        if isinstance(redacted, dict):
+            args_json = _canonical_args_json(redacted)
     path = _primary_path(args)
 
     # --- R7: taint relay (M6) ----------------------------------------------
