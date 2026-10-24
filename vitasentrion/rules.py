@@ -387,7 +387,14 @@ def _is_blocked_ip(token: str) -> Optional[str]:
     return None
 
 
-def find_network_hits(text: str) -> list[tuple[str, str]]:
+# ``host:port`` allow-list helpers ([guard].allow_hosts).
+_HOST_PORT_TAIL_RE = re.compile(r":(\d{1,5})(?![\w.])")
+_HOST_TOKEN_BEFORE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*$")
+
+
+def find_network_hits(
+    text: str, config: Optional[VitaConfig] = None
+) -> list[tuple[str, str]]:
     """Return ``(label, description)`` network/scope hits in *text* (M4.5 A1).
 
     IPv4 literals are validated with the :mod:`ipaddress` module against
@@ -395,8 +402,16 @@ def find_network_hits(text: str) -> list[tuple[str, str]]:
     ``scp`` require proper token boundaries, so timestamps
     (``12:22:05``), versions (``v10.0.5``) and identifiers (``ssh_key``)
     never false-positive.  Shared by R6 and the guard.
+
+    ``[guard].allow_hosts`` entries (exact ``host:port`` pairs) suppress
+    exactly the matching occurrences: a blocked IPv4 only when written as
+    ``ip:port`` with that exact pair, and a ``:22`` only when the host
+    token right before it forms an allowed pair.  The same host on
+    another port, the host without a port, and every other occurrence
+    stay blocked.
     """
     low = (text or "").lower()
+    allowed = frozenset(config.allow_hosts) if config is not None else frozenset()
     hits: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -407,9 +422,21 @@ def find_network_hits(text: str) -> list[tuple[str, str]]:
 
     for match in IPV4_RE.finditer(low):
         net = _is_blocked_ip(match.group(1))
-        if net is not None:
-            _add(net, f"blocked network {net} ({match.group(1)})")
-    if SSH_PORT_RE.search(low):
+        if net is None:
+            continue
+        if allowed:
+            tail = _HOST_PORT_TAIL_RE.match(low, match.end())
+            if tail and f"{match.group(1)}:{tail.group(1)}" in allowed:
+                continue
+        _add(net, f"blocked network {net} ({match.group(1)})")
+    port_hit = False
+    for match in SSH_PORT_RE.finditer(low):
+        if allowed:
+            host = _HOST_TOKEN_BEFORE_RE.search(low, 0, match.start())
+            if host and f"{host.group(0)}:22" in allowed:
+                continue
+        port_hit = True
+    if port_hit:
         _add(":22", "targets SSH port :22")
     if SSH_COMMAND_RE.search(low):
         _add("ssh", "invokes ssh/scp")
@@ -731,7 +758,7 @@ def rule_r6_network_and_scope_escape(
         # M4.5 amendment 1: IPv4 / :22 / ssh detection goes through the
         # shared ipaddress-backed helpers, so "12:22:05" / "v10.0.5" /
         # "ssh_key" can never false-positive.
-        for label, description in find_network_hits(blob):
+        for label, description in find_network_hits(blob, config):
             details.append(f"event '{event.tool_name}' {description}")
         if event.tool_name in WRITE_TOOLS:
             for path in _iter_path_values(event.arguments):

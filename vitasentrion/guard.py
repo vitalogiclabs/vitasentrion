@@ -277,15 +277,18 @@ def _check_destructive(text: str) -> list[str]:
     return find_destructive_ops(text)
 
 
-def _check_network(text: str) -> list[tuple[str, str]]:
+def _check_network(
+    text: str, config: Optional[VitaConfig] = None
+) -> list[tuple[str, str]]:
     """Network / scope-escape hits in *text* (shared, M4.5 A1).
 
     Returns ``(label, description)`` pairs: blocked IPv4 networks
     (checked with the :mod:`ipaddress` module), ``:22`` and
     ``ssh``/``scp``.  Timestamps (``12:22:05``), versions (``v10.0.5``)
-    and identifiers (``ssh_key``) never match.
+    and identifiers (``ssh_key``) never match.  ``[guard].allow_hosts``
+    entries suppress exactly the matching host:port occurrences.
     """
-    return find_network_hits(text)
+    return find_network_hits(text, config)
 
 
 def _workspace_root_for(
@@ -456,7 +459,7 @@ def _evaluate_one(
             f"tool '{name}' pipes a downloaded script into a shell"
         )
 
-    for _label, desc in _check_network(text_low):
+    for _label, desc in _check_network(text_low, config):
         r6_details.append(f"tool '{name}' {desc}")
 
     for token in SENSITIVE_FILE_TOKENS:

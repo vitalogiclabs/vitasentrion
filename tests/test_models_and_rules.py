@@ -946,6 +946,32 @@ class TestR6NetworkAndScopeEscape(unittest.TestCase):
         t.tool_events = [ev("write_file", arguments={"path": here + "/a.py"})]
         self.assertIsNone(rule_r6_network_and_scope_escape(t))
 
+    def test_allow_hosts_ignores_listed_pair(self):
+        t = clean_trace()
+        t.tool_events = [
+            ev("terminal", arguments={"command": "curl http://10.1.2.3:8080/x"})
+        ]
+        self.assertIsNone(rule_r6_network_and_scope_escape(
+            t, config=VitaConfig(allow_hosts=("10.1.2.3:8080",))))
+
+    def test_allow_hosts_other_port_still_flagged(self):
+        t = clean_trace()
+        t.tool_events = [
+            ev("terminal", arguments={"command": "curl http://10.1.2.3:9090/x"})
+        ]
+        self.assertIsNotNone(rule_r6_network_and_scope_escape(
+            t, config=VitaConfig(allow_hosts=("10.1.2.3:8080",))))
+
+    def test_allow_hosts_chained_with_blocked_still_flagged(self):
+        t = clean_trace()
+        t.tool_events = [
+            ev("terminal", arguments={
+                "command": "curl http://10.1.2.3:8080/ok; ping 10.9.8.7"
+            })
+        ]
+        self.assertIsNotNone(rule_r6_network_and_scope_escape(
+            t, config=VitaConfig(allow_hosts=("10.1.2.3:8080",))))
+
     def test_read_outside_workspace_not_flagged_by_r6(self):
         # Only write-type tools count for path escape.
         t = clean_trace()

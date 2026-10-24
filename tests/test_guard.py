@@ -419,6 +419,74 @@ class TestConfigWorkspaceRoot(GuardBase):
 
 
 # ---------------------------------------------------------------------------
+# [guard].allow_hosts
+# ---------------------------------------------------------------------------
+
+class TestAllowHosts(GuardBase):
+    """allow_hosts suppresses exactly the listed host:port pairs."""
+
+    def eval_hosts(self, payload: dict, hosts: list[str]):
+        cfg = VitaConfig(allow_hosts=tuple(hosts))
+        return evaluate_hook_payload(
+            payload, state_file=self.state, config=cfg
+        )
+
+    def test_allowed_host_port_ignored(self):
+        allowed, _, _ = self.eval_hosts(
+            claude_payload("curl http://10.1.2.3:8080/health"),
+            ["10.1.2.3:8080"],
+        )
+        self.assertTrue(allowed)
+
+    def test_same_host_other_port_blocked(self):
+        allowed, _, findings = self.eval_hosts(
+            claude_payload("curl http://10.1.2.3:9090/health"),
+            ["10.1.2.3:8080"],
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_host_without_port_blocked(self):
+        allowed, _, findings = self.eval_hosts(
+            claude_payload("curl http://10.1.2.3/health"),
+            ["10.1.2.3:8080"],
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_other_private_ip_blocked(self):
+        allowed, _, findings = self.eval_hosts(
+            claude_payload("curl http://192.168.1.5:8080/"),
+            ["10.1.2.3:8080"],
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_allowed_chained_with_blocked_still_blocked(self):
+        allowed, _, findings = self.eval_hosts(
+            claude_payload(
+                "curl http://10.1.2.3:8080/ok; curl http://10.9.8.7:8080"
+            ),
+            ["10.1.2.3:8080"],
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_allowed_ssh_port_pair(self):
+        allowed, _, _ = self.eval_hosts(
+            claude_payload("nc db.internal:22"), ["db.internal:22"]
+        )
+        self.assertTrue(allowed)
+
+    def test_other_host_ssh_port_still_blocked(self):
+        allowed, _, findings = self.eval_hosts(
+            claude_payload("nc other.internal:22"), ["db.internal:22"]
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+
+# ---------------------------------------------------------------------------
 # R1: stateful loop breaker
 # ---------------------------------------------------------------------------
 
