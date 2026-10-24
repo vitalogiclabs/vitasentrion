@@ -440,5 +440,89 @@ class ConfigCliTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# [guard] workspace_root / allow_hosts / allow_sudo / taint_seconds
+# ---------------------------------------------------------------------------
+
+class GuardSettingsConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_config(self, text: str, name: str = "vitasentrion.toml") -> Path:
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_new_guard_defaults(self):
+        cfg = load_config(start_dir=self.root)
+        self.assertIsNone(cfg.workspace_root)
+        self.assertEqual(cfg.allow_hosts, ())
+        self.assertEqual(cfg.allow_sudo, ())
+        self.assertEqual(cfg.taint_seconds, 300)
+
+    def test_new_guard_keys_valid(self):
+        self.write_config(
+            """
+[guard]
+workspace_root = "/srv/app/data/"
+allow_hosts = ["10.1.2.3:8080", "Proxy.Example.COM:22"]
+allow_sudo = ["/usr/local/sbin/hermes-apt-install"]
+taint_seconds = 60
+"""
+        )
+        cfg = load_config(start_dir=self.root)
+        self.assertEqual(cfg.workspace_root, "/srv/app/data")
+        self.assertEqual(
+            cfg.allow_hosts, ("10.1.2.3:8080", "proxy.example.com:22")
+        )
+        self.assertEqual(
+            cfg.allow_sudo, ("/usr/local/sbin/hermes-apt-install",)
+        )
+        self.assertEqual(cfg.taint_seconds, 60)
+
+    def test_taint_seconds_zero_allowed(self):
+        self.write_config("[guard]\ntaint_seconds = 0\n")
+        self.assertEqual(load_config(start_dir=self.root).taint_seconds, 0)
+
+    def test_workspace_root_relative_rejected(self):
+        self.write_config('[guard]\nworkspace_root = "srv/app"\n')
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_workspace_root_non_string_rejected(self):
+        self.write_config("[guard]\nworkspace_root = 5\n")
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_allow_hosts_without_port_rejected(self):
+        self.write_config('[guard]\nallow_hosts = ["127.0.0.1"]\n')
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_allow_hosts_bad_port_rejected(self):
+        self.write_config('[guard]\nallow_hosts = ["host:notaport"]\n')
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_allow_sudo_relative_path_rejected(self):
+        self.write_config('[guard]\nallow_sudo = ["usr/bin/mytool"]\n')
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_taint_seconds_negative_rejected(self):
+        self.write_config("[guard]\ntaint_seconds = -1\n")
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_taint_seconds_bool_rejected(self):
+        self.write_config("[guard]\ntaint_seconds = true\n")
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+
 if __name__ == "__main__":
     unittest.main()

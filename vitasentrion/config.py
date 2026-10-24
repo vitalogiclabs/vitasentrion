@@ -12,6 +12,10 @@ Schema (all keys optional)::
     state_ttl_seconds = 3600       # loop-breaker state TTL
     ignore_paths = [".scratch/*"]  # paths skipped by guard / scan
     redact_secrets = false         # R5 redaction mode (M10, P2-a)
+    workspace_root = "/srv/app"    # root scope escapes are measured against
+    allow_hosts = ["127.0.0.1:8080"]  # R6 network hits ignored for these host:port
+    allow_sudo = ["/usr/bin/mytool"]  # R6 blocks `sudo <path>` only outside this list
+    taint_seconds = 300            # R7 taint lifetime (egress after taint)
 
     [rules]
     R3 = "warn"                    # per-rule action: block | warn | ignore
@@ -66,6 +70,8 @@ RULE_ACTIONS = ("block", "warn", "ignore")
 # Defaults are exactly the constants that were hardcoded before M8.
 DEFAULT_MAX_CONSECUTIVE_EDITS = 3
 DEFAULT_STATE_TTL_SECONDS = 3600
+# R7 taint window in seconds (the M6 relay window ages out by wall clock).
+DEFAULT_TAINT_SECONDS = 300
 
 
 class ConfigError(Exception):
@@ -85,6 +91,10 @@ class VitaConfig:
     state_ttl_seconds: int = DEFAULT_STATE_TTL_SECONDS
     ignore_paths: tuple[str, ...] = ()
     redact_secrets: bool = False
+    workspace_root: Optional[str] = None  # None = fall back to cwd / payload cwd
+    allow_hosts: tuple[str, ...] = ()  # "host:port" pairs the R6 net check ignores
+    allow_sudo: tuple[str, ...] = ()  # absolute paths allowed as `sudo <path>`
+    taint_seconds: int = DEFAULT_TAINT_SECONDS  # R7 taint lifetime
     rule_actions: dict[str, str] = field(default_factory=dict)
     blocked_commands: tuple[str, ...] = ()
     secret_patterns: tuple[str, ...] = ()
@@ -143,6 +153,47 @@ def _validate_regexes(section: str, key: str, values: tuple[str, ...]) -> None:
             ) from exc
 
 
+_HOST_PORT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*:\d{1,5}$")
+
+
+def _require_abs_path(section: str, key: str, value: Any) -> str:
+    """A single absolute filesystem path, normalised (no trailing slash)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(
+            f"[{section}].{key} must be a non-empty absolute path, got {value!r}"
+        )
+    path = value.strip()
+    if not path.startswith("/"):
+        raise ConfigError(
+            f"[{section}].{key} must be an absolute path (start with '/'), "
+            f"got {value!r}"
+        )
+    normalized = os.path.normpath(path)
+    if normalized != "/":
+        normalized = normalized.rstrip("/")
+    return normalized
+
+
+def _require_host_ports(section: str, key: str, value: Any) -> tuple[str, ...]:
+    """A list of exact ``host:port`` pairs (lowercased for matching)."""
+    entries = _require_str_list(section, key, value)
+    out = []
+    for entry in entries:
+        candidate = entry.strip().lower()
+        if not _HOST_PORT_RE.match(candidate):
+            raise ConfigError(
+                f"[{section}].{key} entries must be 'host:port' with a numeric "
+                f"port, got {entry!r}"
+            )
+        out.append(candidate)
+    return tuple(out)
+
+
+def _require_abs_path_list(section: str, key: str, value: Any) -> tuple[str, ...]:
+    entries = _require_str_list(section, key, value)
+    return tuple(_require_abs_path(section, key, entry) for entry in entries)
+
+
 def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
     """Validate a parsed TOML mapping into a :class:`VitaConfig`.
 
@@ -162,7 +213,8 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
     for key in guard:
         if key not in (
             "max_consecutive_edits", "state_ttl_seconds", "ignore_paths",
-            "redact_secrets",
+            "redact_secrets", "workspace_root", "allow_hosts", "allow_sudo",
+            "taint_seconds",
         ):
             raise ConfigError(f"unknown key [guard].{key}")
     if "max_consecutive_edits" in guard:
@@ -184,6 +236,26 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
                 f"{guard['redact_secrets']!r}"
             )
         cfg.redact_secrets = guard["redact_secrets"]
+    if "workspace_root" in guard:
+        cfg.workspace_root = _require_abs_path(
+            "guard", "workspace_root", guard["workspace_root"]
+        )
+    if "allow_hosts" in guard:
+        cfg.allow_hosts = _require_host_ports(
+            "guard", "allow_hosts", guard["allow_hosts"]
+        )
+    if "allow_sudo" in guard:
+        cfg.allow_sudo = _require_abs_path_list(
+            "guard", "allow_sudo", guard["allow_sudo"]
+        )
+    if "taint_seconds" in guard:
+        taint = guard["taint_seconds"]
+        if isinstance(taint, bool) or not isinstance(taint, int) or taint < 0:
+            raise ConfigError(
+                "[guard].taint_seconds must be a non-negative integer, got "
+                f"{taint!r}"
+            )
+        cfg.taint_seconds = taint
 
     rules = data.get("rules", {})
     if not isinstance(rules, dict):
