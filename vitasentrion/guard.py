@@ -74,6 +74,7 @@ from .rules import (
     extract_primary_path,
     extra_secret_patterns,
     find_destructive_ops,
+    find_sudo_hits,
     find_network_hits,
     is_sensitive_path,
     redact_args,
@@ -105,8 +106,8 @@ DESTRUCTIVE_GIT_COMMANDS = DESTRUCTIVE_GIT_OPS
 
 LOOP_BREAKER_MESSAGE = "Loop Breaker: 3 consecutive identical tool calls"
 
-# sudo as a command (word-boundary protected so "sudo.rs" never matches).
-SUDO_RE = re.compile(r"(?:^|[\s;&|])sudo\b")
+# sudo detection lives in rules.find_sudo_hits (shared with post-hoc R6),
+# honouring the [guard].allow_sudo allow-list.
 
 SENSITIVE_FILE_TOKENS = (
     "/etc/passwd",
@@ -124,6 +125,26 @@ _SCAN_ARG_KEYS = frozenset(
     (
         "command", "cmd", "code", "script", "shell_command", "bash_command",
         "input", "patch", "text", "data", "content", "output",
+    )
+)
+
+# Tools that write or edit file bodies (the guard sees the Claude tool names
+# Write / Edit / MultiEdit / NotebookEdit and the generic names).  For these
+# tools the *content* argument keys below carry file bodies, not commands:
+# the R6 command checks (sudo / network / pipe-to-shell / .env / ssh key)
+# do not scan them.  Path arguments are still scope-checked, and R5 secret
+# scanning still sees the full arguments.
+EDIT_WRITE_TOOLS = frozenset(
+    (
+        "write", "write_file", "create_file", "edit", "edit_file",
+        "multi_file_edit", "multiedit", "notebookedit", "str_replace_editor",
+        "apply_patch", "patch",
+    )
+)
+CONTENT_ARG_KEYS = frozenset(
+    (
+        "content", "new_string", "old_string", "new_source", "notebook_content",
+        "file_content", "input", "patch", "text", "data",
     )
 )
 
@@ -232,12 +253,18 @@ def _primary_path(args: dict) -> str:
     return extract_primary_path(args) or ""
 
 
-def _call_text(args: dict) -> str:
-    """The command / content material of a call (R4 / R5 / R6 target)."""
+def _call_text(args: dict, exclude_content: bool = False) -> str:
+    """The command / content material of a call (R4 / R5 / R6 target).
+
+    ``exclude_content=True`` (write / edit tools) drops the file-body
+    argument keys: R6 command checks then run over commands only, while
+    path arguments and R5 secret scanning still see everything.
+    """
     parts = [
         value
         for key, value in args.items()
         if isinstance(value, str) and key.lower() in _SCAN_ARG_KEYS
+        and not (exclude_content and key.lower() in CONTENT_ARG_KEYS)
     ]
     return "\n".join(parts)
 
@@ -449,25 +476,37 @@ def _evaluate_one(
                 reasons.append("secret leakage in arguments")
 
     # --- R6: network / scope escapes --------------------------------------
+    # Command checks (sudo / pipe-to-shell / network / sensitive files)
+    # run over command material plus path arguments only: for write and
+    # edit tools the file-body keys are excluded, so describing sensitive
+    # names inside file content is not a scope escape.  Path arguments are
+    # still scanned, and writes outside the root are checked below.
+    if name.lower() in EDIT_WRITE_TOOLS:
+        r6_text = "\n".join(
+            [_call_text(args, exclude_content=True)] + list(_iter_path_values(args))
+        )
+    else:
+        r6_text = text
+    r6_text_low = r6_text.lower()
     r6_details: list[str] = []
 
-    if SUDO_RE.search(text_low):
+    if find_sudo_hits(r6_text_low, config):
         r6_details.append(f"tool '{name}' invokes sudo (privilege escalation)")
 
-    if PIPE_TO_SHELL_RE.search(text):
+    if PIPE_TO_SHELL_RE.search(r6_text):
         r6_details.append(
             f"tool '{name}' pipes a downloaded script into a shell"
         )
 
-    for _label, desc in _check_network(text_low, config):
+    for _label, desc in _check_network(r6_text_low, config):
         r6_details.append(f"tool '{name}' {desc}")
 
     for token in SENSITIVE_FILE_TOKENS:
-        if token in text_low:
+        if token in r6_text_low:
             r6_details.append(f"tool '{name}' touches sensitive file {token!r}")
-    if ENV_FILE_RE.search(text):
+    if ENV_FILE_RE.search(r6_text):
         r6_details.append(f"tool '{name}' touches a .env file")
-    if SSH_ID_RSA_MARKER in text_low:
+    if SSH_ID_RSA_MARKER in r6_text_low:
         r6_details.append(f"tool '{name}' touches {SSH_ID_RSA_MARKER!r}")
 
     r6_details.extend(
