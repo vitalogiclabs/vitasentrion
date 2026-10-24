@@ -30,7 +30,9 @@ class SessionTrace:
     """Aggregated record of one agent session to be evaluated."""
 
     session_id: str
-    workspace_root: str = "/workspace"
+    # "" = not stated by the source; resolved by the parsers/guard/cli chain
+    # ([guard].workspace_root setting, payload cwd, or process cwd).
+    workspace_root: str = ""
     tool_events: list[ToolEvent] = field(default_factory=list)
     files_modified: set[str] = field(default_factory=set)
     files_created: set[str] = field(default_factory=set)

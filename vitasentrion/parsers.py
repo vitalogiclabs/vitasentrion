@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any, Optional, Union
 
+from .config import VitaConfig
 from .models import SessionTrace, ToolEvent
 
 __all__ = ["parse_trace"]
@@ -480,13 +481,19 @@ def _duration(acc: _Accumulator, meta_containers: list[Any]) -> float:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def parse_trace(source: Union[str, os.PathLike[str], IO[Any]]) -> SessionTrace:
+def parse_trace(
+    source: Union[str, os.PathLike[str], IO[Any]],
+    *,
+    config: Optional[VitaConfig] = None,
+) -> SessionTrace:
     """Parse a Claude Code / Cline / OpenAI(-Hermes) trace into a SessionTrace.
 
     *source* is a filesystem path (str or Path), a file-like object, or the
     raw JSON/JSONL content as a string.  The format is chosen from the file
     extension (``.jsonl`` prefers line-wise parsing) and from the content
-    itself, so the formats work regardless of extension.
+    itself, so the formats work regardless of extension.  When the trace
+    metadata states no workspace root, ``config.workspace_root`` (the
+    ``[guard]`` setting) is used if given, else the process cwd.
     """
     text, name = _coerce_text(source)
     text = text.strip()
@@ -570,7 +577,11 @@ def parse_trace(source: Union[str, os.PathLike[str], IO[Any]]) -> SessionTrace:
         or (Path(name).stem if name else None)
         or hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]
     )
-    workspace_root = _lookup_workspace(*meta_containers) or "/workspace"
+    workspace_root = (
+        _lookup_workspace(*meta_containers)
+        or (config.workspace_root if config is not None else None)
+        or os.getcwd()
+    )
 
     trace = SessionTrace(session_id=session_id, workspace_root=workspace_root)
 

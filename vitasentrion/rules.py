@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
 from typing import Any, Iterable, Optional
 
@@ -710,6 +711,13 @@ def rule_r6_network_and_scope_escape(
     trace: SessionTrace, config: Optional[VitaConfig] = None
 ) -> Optional[Finding]:
     details: list[str] = []
+    # Root chain: trace metadata > [guard].workspace_root > process cwd
+    # (no hardcoded default; "" from models means "not stated by source").
+    root = (
+        trace.workspace_root
+        or (config.workspace_root if config is not None else None)
+        or os.getcwd()
+    )
     for event in trace.tool_events:
         blob = _event_blob(event)
         if "sudo " in blob:
@@ -727,7 +735,7 @@ def rule_r6_network_and_scope_escape(
             details.append(f"event '{event.tool_name}' {description}")
         if event.tool_name in WRITE_TOOLS:
             for path in _iter_path_values(event.arguments):
-                if _outside_workspace(path, trace.workspace_root):
+                if _outside_workspace(path, root):
                     details.append(
                         f"event '{event.tool_name}' writes outside workspace "
                         f"root at {path!r}"

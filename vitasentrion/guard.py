@@ -288,9 +288,20 @@ def _check_network(text: str) -> list[tuple[str, str]]:
     return find_network_hits(text)
 
 
-def _workspace_root_for(payload: dict, workspace_root: Optional[str]) -> str:
+def _workspace_root_for(
+    payload: dict,
+    workspace_root: Optional[str],
+    config: Optional[VitaConfig] = None,
+) -> str:
+    """Resolve the root scope checks run against.
+
+    Chain: explicit argument > ``[guard].workspace_root`` config setting >
+    payload ``cwd`` > process cwd.  (There is no hardcoded default.)
+    """
     if workspace_root:
         return str(workspace_root)
+    if config is not None and config.workspace_root:
+        return config.workspace_root
     cwd = payload.get("cwd")
     if isinstance(cwd, str) and cwd:
         return cwd
@@ -704,8 +715,9 @@ def evaluate_hook_payload(
         mapping.  An optional ``cwd`` key is honoured as the workspace root
         when *workspace_root* is not given.
     workspace_root:
-        The repository / sandbox root the call must stay inside.  Defaults
-        to the payload ``cwd`` or :func:`os.getcwd`.
+        The repository / sandbox root the call must stay inside.  When not
+        given, the ``[guard].workspace_root`` config setting is used, then
+        the payload ``cwd``, then :func:`os.getcwd` (no hardcoded default).
     state_file:
         Where the stateful loop-breaker run is persisted.  Defaults to a
         sha256-keyed file in the system temp dir (never inside the repo).
@@ -726,7 +738,7 @@ def evaluate_hook_payload(
         return True, "Allowed (empty payload)", []
 
     name, args = _extract_call(payload)
-    root = _workspace_root_for(payload, workspace_root)
+    root = _workspace_root_for(payload, workspace_root, config)
     sf = Path(state_file) if state_file else _default_state_file(root)
 
     # --- [guard].ignore_paths: skip checks, still log the event (M8) -----

@@ -138,7 +138,20 @@ def cmd_scan(args) -> int:
 
 def cmd_guard(args) -> int:
     state_path = Path(args.state_file).resolve() if args.state_file else None
-    ws_root = Path(args.workspace).resolve() if args.workspace else Path.cwd()
+    ws_from_cli = bool(args.workspace)
+    cli_ws = Path(args.workspace).resolve() if args.workspace else Path.cwd()
+
+    cfg = _load_cli_config(args, cli_ws)
+    if cfg is None:
+        return 1
+
+    # Chain: --workspace flag > [guard].workspace_root setting > cwd.
+    if ws_from_cli:
+        ws_root = cli_ws
+    elif cfg.workspace_root:
+        ws_root = Path(cfg.workspace_root)
+    else:
+        ws_root = Path.cwd()
 
     if args.reset:
         sf = state_path if state_path else _default_state_file(str(ws_root))
@@ -158,9 +171,6 @@ def cmd_guard(args) -> int:
         sys.stderr.write(f"VitaSentrion: invalid JSON on stdin: {e}\n")
         return 2
 
-    cfg = _load_cli_config(args, ws_root)
-    if cfg is None:
-        return 1
     allowed, reason, findings = evaluate_hook_payload(
         payload, state_file=state_path, workspace_root=ws_root, config=cfg
     )

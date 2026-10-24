@@ -1,9 +1,11 @@
 """Unit tests for vitasentrion.models and vitasentrion.rules (SPEC.md)."""
 from __future__ import annotations
 
+import os
 import unittest
 from typing import Any, Optional
 
+from vitasentrion.config import VitaConfig
 from vitasentrion.models import (
     Finding,
     Scorecard,
@@ -45,6 +47,8 @@ def ev(tool_name="terminal", **kwargs: Any) -> ToolEvent:
 def clean_trace(session_id="s1") -> SessionTrace:
     return SessionTrace(
         session_id=session_id,
+        # Traces normally state their root; the model no longer defaults it.
+        workspace_root="/workspace",
         tool_events=[
             ev("terminal", arguments={"command": "ls"}, output="ok"),
         ],
@@ -136,7 +140,8 @@ class TestToolEvent(unittest.TestCase):
 class TestSessionTrace(unittest.TestCase):
     def test_defaults(self):
         t = SessionTrace(session_id="abc")
-        self.assertEqual(t.workspace_root, "/workspace")
+        # "" means "not stated by the source"; the config/cwd chain fills it.
+        self.assertEqual(t.workspace_root, "")
         self.assertEqual(t.tool_events, [])
         self.assertEqual(t.files_modified, set())
         self.assertEqual(t.files_created, set())
@@ -919,6 +924,27 @@ class TestR6NetworkAndScopeEscape(unittest.TestCase):
         ]
         f = not_none(rule_r6_network_and_scope_escape(t))
         self.assertTrue(any("/srv/other/a.py" in d for d in f.details))
+
+    def test_config_workspace_root_used_when_trace_silent(self):
+        # Trace states no root: the [guard].workspace_root setting drives it.
+        t = clean_trace()
+        t.workspace_root = ""
+        t.tool_events = [
+            ev("write_file", arguments={"path": "/srv/app/a.py"}),
+            ev("write_file", arguments={"path": "/etc/cron.d/evil"}),
+        ]
+        f = not_none(rule_r6_network_and_scope_escape(
+            t, config=VitaConfig(workspace_root="/srv/app")))
+        self.assertFalse(any("/srv/app/a.py" in d for d in f.details))
+        self.assertTrue(any("/etc/cron.d/evil" in d for d in f.details))
+
+    def test_root_falls_back_to_process_cwd(self):
+        # No trace root and no config: process cwd (not a hardcoded path).
+        t = clean_trace()
+        t.workspace_root = ""
+        here = os.getcwd().rstrip("/")
+        t.tool_events = [ev("write_file", arguments={"path": here + "/a.py"})]
+        self.assertIsNone(rule_r6_network_and_scope_escape(t))
 
     def test_read_outside_workspace_not_flagged_by_r6(self):
         # Only write-type tools count for path escape.

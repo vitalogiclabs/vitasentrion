@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 
+from vitasentrion.config import VitaConfig
 from vitasentrion.models import SessionTrace, ToolEvent
 from vitasentrion.parsers import (
     _content_to_text,
@@ -747,7 +749,23 @@ class TestDetectionAndEdgeCases(unittest.TestCase):
     def test_workspace_root_defaults_when_absent(self):
         content = json.dumps([{"role": "assistant", "content": "hi"}])
         trace = parse_trace(content)
-        self.assertEqual(trace.workspace_root, "/workspace")
+        # No hardcoded /workspace: the fallback is the process cwd.
+        self.assertEqual(trace.workspace_root, os.getcwd())
+
+    def test_workspace_root_config_setting_used_when_absent(self):
+        content = json.dumps([{"role": "assistant", "content": "hi"}])
+        cfg = VitaConfig(workspace_root="/srv/my-app")
+        trace = parse_trace(content, config=cfg)
+        self.assertEqual(trace.workspace_root, "/srv/my-app")
+
+    def test_workspace_root_metadata_beats_config_setting(self):
+        content = json.dumps(
+            {"session_id": "s", "workspace_root": "/trace/root",
+             "messages": [{"role": "assistant", "content": "hi"}]}
+        )
+        cfg = VitaConfig(workspace_root="/srv/my-app")
+        trace = parse_trace(content, config=cfg)
+        self.assertEqual(trace.workspace_root, "/trace/root")
 
     def test_tool_event_arguments_never_a_string(self):
         trace = parse_trace(claude_jsonl_text())

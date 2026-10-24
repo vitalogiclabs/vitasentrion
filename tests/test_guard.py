@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 import vitasentrion.guard as guard
+from vitasentrion.config import VitaConfig
 from vitasentrion.guard import (
     LOOP_BREAKER_MESSAGE,
     _default_state_file,
@@ -373,6 +374,48 @@ class TestNetworkAndScopeEscape(GuardBase):
             claude_payload("curl https://example.com/data.json")
         )
         self.assertTrue(allowed)
+
+
+# ---------------------------------------------------------------------------
+# [guard].workspace_root setting (no hardcoded default)
+# ---------------------------------------------------------------------------
+
+class TestConfigWorkspaceRoot(GuardBase):
+    """The [guard].workspace_root setting drives the scope checks."""
+
+    def eval_config(self, payload: dict):
+        cfg = VitaConfig(workspace_root=str(self.root))
+        return evaluate_hook_payload(
+            payload, state_file=self.state, config=cfg
+        )
+
+    def test_write_under_config_root_allowed(self):
+        allowed, _, _ = self.eval_config(
+            generic_payload("write_file", path=str(self.root / "a.py"))
+        )
+        self.assertTrue(allowed)
+
+    def test_write_outside_config_root_blocked(self):
+        allowed, _, findings = self.eval_config(
+            generic_payload("write_file", path="/etc/cron.d/evil")
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_config_root_beats_payload_cwd(self):
+        # Config root wins over the payload cwd: a write under the config
+        # root is allowed even when cwd points elsewhere...
+        payload = generic_payload("write_file", path=str(self.root / "a.py"))
+        payload["cwd"] = "/opt/other-cwd"
+        allowed, _, _ = self.eval_config(payload)
+        self.assertTrue(allowed)
+        # ...and a write under the payload cwd is blocked when it is
+        # outside the config root.
+        payload2 = generic_payload("write_file", path="/opt/other-cwd/b.py")
+        payload2["cwd"] = "/opt/other-cwd"
+        allowed2, _, findings2 = self.eval_config(payload2)
+        self.assertFalse(allowed2)
+        self.assertIn("R6", rule_ids(findings2))
 
 
 # ---------------------------------------------------------------------------
