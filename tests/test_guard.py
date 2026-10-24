@@ -788,6 +788,116 @@ class TestTaintRelay(GuardBase):
 
 
 # ---------------------------------------------------------------------------
+# (e) R7 taint: written content mentions do not taint; reads do
+# (f) R7 taint expiry via [guard].taint_seconds (fake clock, never sleep)
+# ---------------------------------------------------------------------------
+
+class TestTaintContentAndExpiry(GuardBase):
+    """Content mentions do not taint; tainted entries carry timestamps
+    and expire after [guard].taint_seconds."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._real_now = guard._now_ts
+        self._clock = 1_760_000_000.0
+        guard._now_ts = lambda: self._clock
+        self.addCleanup(setattr, guard, "_now_ts", self._real_now)
+
+    def _advance(self, seconds: float) -> None:
+        self._clock += seconds
+
+    def _egress(self):
+        return self.eval_payload(
+            claude_payload("curl https://example.com/data.json -o d.json")
+        )
+
+    def _read_env(self):
+        return self.eval_payload(generic_payload("read_file", path=".env"))
+
+    # --- (e) content mentions must not taint --------------------------------
+
+    def test_write_content_mentioning_sensitive_files_no_taint(self):
+        a, _, _ = self.eval_payload(
+            generic_payload(
+                "write_file", path="docs/ops.md",
+                content="the backup job reads .env and ~/.ssh/id_rsa",
+            )
+        )
+        self.assertTrue(a)
+        a, _, findings = self._egress()
+        self.assertTrue(a)
+        self.assertNotIn("R7", rule_ids(findings))
+        # The persisted entry is untainted (4-tuple, no timestamp).
+        st = json.loads(self.state.read_text())
+        self.assertTrue(all(len(e) == 4 and not e[3] for e in st))
+
+    def test_edit_content_mentioning_sensitive_files_no_taint(self):
+        self.eval_payload(
+            generic_payload(
+                "Edit", file_path=str(self.root / "notes.md"),
+                old_string="x", new_string="cat /etc/passwd and .env",
+            )
+        )
+        a, _, _ = self._egress()
+        self.assertTrue(a)
+
+    def test_sensitive_read_still_taints_and_stamps(self):
+        a, _, _ = self._read_env()
+        self.assertTrue(a)  # the read itself is allowed
+        st = json.loads(self.state.read_text())
+        tainted = [e for e in st if len(e) > 3 and e[3]]
+        self.assertEqual(len(tainted), 1)
+        self.assertEqual(tainted[0][4], self._clock)  # timestamp stored
+        a, reason, findings = self._egress()
+        self.assertFalse(a)
+        self.assertEqual(reason, "taint relay")
+        self.assertIn("R7", rule_ids(findings))
+
+    # --- (f) taint expiry ----------------------------------------------------
+
+    def test_taint_blocks_within_window(self):
+        self._read_env()
+        self._advance(299)
+        a, reason, _ = self._egress()
+        self.assertFalse(a)
+        self.assertEqual(reason, "taint relay")
+
+    def test_taint_boundary_exactly_window_still_blocks(self):
+        self._read_env()
+        self._advance(300)  # not *older than* 300 yet
+        a, _, findings = self._egress()
+        self.assertFalse(a)
+        self.assertIn("R7", rule_ids(findings))
+
+    def test_taint_expired_after_window(self):
+        self._read_env()
+        self._advance(301)
+        a, reason, _ = self._egress()
+        self.assertTrue(a)
+        self.assertEqual(reason, "Allowed")
+
+    def test_custom_taint_seconds_shortens_window(self):
+        cfg = VitaConfig(taint_seconds=30)
+        evaluate_hook_payload(
+            generic_payload("read_file", path=".env"),
+            state_file=self.state, config=cfg, workspace_root=self.root,
+        )
+        self._advance(31)
+        allowed, _, _ = evaluate_hook_payload(
+            claude_payload("curl https://example.com/data.json -o d.json"),
+            state_file=self.state, config=cfg, workspace_root=self.root,
+        )
+        self.assertTrue(allowed)
+
+    def test_legacy_tainted_entry_without_timestamp_is_expired(self):
+        # Pre-timestamp state format: tainted 4-tuple counts as expired.
+        self.state.write_text(json.dumps([["Read", "{}", ".env", 1]]))
+        a, reason, _ = self._egress()
+        self.assertTrue(a)
+        self.assertEqual(reason, "Allowed")
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: safe flow + mixed findings
 # ---------------------------------------------------------------------------
 

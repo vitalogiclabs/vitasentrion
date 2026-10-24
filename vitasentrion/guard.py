@@ -54,6 +54,7 @@ from typing import Any, Optional
 from .models import Finding, Severity
 from .config import (
     DEFAULT_STATE_TTL_SECONDS,
+    DEFAULT_TAINT_SECONDS,
     VitaConfig,
     path_matches_ignore,
     redaction_enabled,
@@ -149,9 +150,12 @@ CONTENT_ARG_KEYS = frozenset(
 )
 
 # State entry shape: [tool_name, canonical_args_json, primary_path,
-# tainted 0|1]. The run length is derived from consecutive entries, never
-# stored, so the persisted state stays a plain JSON *list* of 4-tuples
-# (M6 grew the shape from 3 to 4; 3-tuples load as untainted).
+# tainted 0|1]; a tainted entry also carries a fifth element, the epoch
+# seconds of the taint (used for the [guard].taint_seconds expiry).
+# The run length is derived from consecutive entries, never stored, so
+# the persisted state stays a plain JSON *list* of 3/4/5-tuples (M6 grew
+# the shape from 3 to 4; 3-tuples load as untainted; tainted entries
+# without a timestamp count as expired).
 _MAX_REMEMBERED = 5
 
 # Loop-breaker state older than this (by the state file's mtime, which
@@ -275,14 +279,43 @@ def _is_tainted_call(name: str, args: dict, path: str) -> bool:
     Taint sources: a primary path argument naming a sensitive file
     (``read_file path=".env"`` — R6 does not block these reads), or any
     path argument / command text touching a sensitive-file token.
+
+    For write / edit tools the file-body arguments are excluded: writing
+    file content that merely *mentions* ``.env`` or ``id_rsa`` is
+    documentation, not a sensitive read, and must not taint the session.
     """
     if is_sensitive_path(path):
         return True
     for value in _iter_path_values(args):
         if is_sensitive_path(value):
             return True
-    text = _call_text(args).lower()
+    text = _call_text(
+        args, exclude_content=name.lower() in EDIT_WRITE_TOOLS
+    ).lower()
     return any(token in text for token in SENSITIVE_PATH_TOKENS)
+
+
+def _now_ts() -> float:
+    """Epoch seconds stamped into tainted state entries.
+
+    A module-level indirection so tests can install a fake clock instead
+    of sleeping to prove the [guard].taint_seconds expiry.
+    """
+    return time.time()
+
+
+def _new_state_entry(name: str, args_json: str, path: str, args: dict) -> list:
+    """Build the state entry appended for a call.
+
+    Tainted entries carry a timestamp (5th element) so the R7 check can
+    expire them after [guard].taint_seconds; untainted entries stay
+    4-tuples.
+    """
+    tainted = int(_is_tainted_call(name, args, path))
+    entry = [name, args_json, path, tainted]
+    if tainted:
+        entry.append(_now_ts())
+    return entry
 
 
 def _is_egress_call(name: str, args: dict) -> bool:
@@ -852,14 +885,22 @@ def evaluate_hook_payload(
     # any network egress inside that window is blocked, so freshly-read
     # secrets/credentials cannot leave the machine (CaMeL-style control,
     # PLAN.md M6). A blocked egress does NOT append to state, so the
-    # taint stays until it ages out of the window or reset_state clears
-    # the file.
+    # taint stays until it expires ([guard].taint_seconds), ages out of
+    # the window or reset_state clears the file. Tainted entries carry
+    # their timestamp; a taint older than taint_seconds no longer blocks,
+    # and legacy entries without a timestamp count as expired.
     if _is_egress_call(name, args):
+        limit = config.taint_seconds if config else DEFAULT_TAINT_SECONDS
+        now = _now_ts()
         tainted_at = next(
             (
                 i
                 for i, entry in enumerate(entries)
-                if isinstance(entry, list) and len(entry) > 3 and entry[3]
+                if isinstance(entry, list)
+                and len(entry) > 4
+                and entry[3]
+                and isinstance(entry[4], (int, float))
+                and now - float(entry[4]) <= limit
             ),
             None,
         )
@@ -906,16 +947,12 @@ def evaluate_hook_payload(
         if finding is not None:
             # M8 "warn": allow the call but report the WARN finding.
             _save_state(
-                sf,
-                entries
-                + [[name, args_json, path,
-                    int(_is_tainted_call(name, args, path))]],
+                sf, entries + [_new_state_entry(name, args_json, path, args)]
             )
             return True, "Allowed", findings + [finding]
 
     _save_state(
-        sf,
-        entries + [[name, args_json, path, int(_is_tainted_call(name, args, path))]],
+        sf, entries + [_new_state_entry(name, args_json, path, args)]
     )
     # M8: a [rules] "warn" action keeps findings at WARN severity; the
     # call is allowed but the caller still receives them.
