@@ -116,8 +116,8 @@ Run: `python -m pytest tests/ -q` -> 460 passed, 50 subtests passed.
 
 - (a) workspace_root setting replaces hardcoded /workspace defaults
 - (b) allow_hosts setting — exact host:port exemptions
-- (c) allow_sudo setting — exact sudo-path exemptions
 - (d) R6 command checks skip written file bodies; R5 and scope unchanged
+  (this commit also carries the (c) allow_sudo implementation)
 - (e,f) R7 taint content fix + taint_seconds expiry
 
 Not pushed (no push access from this workspace); left here for review.
