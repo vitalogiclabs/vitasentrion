@@ -2,7 +2,7 @@
 
 Branch `native-user`, October, 23, 2026. Six changes to the guard rules,
 each with unit tests (positive and negative cases). Baseline on `master`:
-405 passed, 50 subtests. Final on this branch: 460 passed, 50 subtests.
+405 passed, 50 subtests. Final on this branch: 484 passed, 50 subtests.
 No existing test was weakened or deleted. The only baseline assertions
 edited were the two that pinned the old hard-coded `/workspace` default
 (in `test_models_and_rules.py` and `test_parsers.py`); they now assert
@@ -87,6 +87,38 @@ after the sensitive read.
 - Legacy entries without a timestamp (3- and 4-tuples) count as
   **expired**: an old untimestamped taint never blocks.
 
+### g. `python -m vitasentrion` — `__main__.py` ported back
+
+The native-user port dropped the module entry point that the old plugin
+build shipped, so `python -m vitasentrion` failed with
+`No module named vitasentrion.__main__`.
+
+- `vitasentrion/__main__.py` is a verbatim port from the removed plugin
+  backup (`~/.hermes/plugin-yedekleri/vitasentrion-guard-kaldirildi-20261023-2135/`):
+  `sys.exit(main())` from `cli.main`.
+
+### h. `[guard].state_dir` + `VITASENTRION_STATE_DIR` fallback ported back
+
+The plugin build let the guard's state + events files live outside the
+system temp dir; the native port lost the whole feature (the key was an
+"unknown [guard] key" error).
+
+- `config.py`: `VitaConfig.state_dir` (`None` -> tempdir default),
+  `[guard].state_dir` key (validated: non-empty string, stripped), and
+  the `VITASENTRION_STATE_DIR` env fallback — the env value applies when
+  the config file does not set the key; when both are set, the config
+  value wins. `default_config()` (no config file) picks up the env var.
+- `guard.py`: `resolve_state_dir()` (absolute used as given, relative
+  against the workspace root, `~` expanded);
+  `_default_state_file(root, state_dir)`; the state dir is a HARD block
+  in `_scope_escape_paths` — any write into it is R6-blocked even when
+  it sits inside the workspace or the scratch dir, checked before the
+  scratch exceptions, and a configured state_dir never widens the
+  scratch exception; `evaluate_hook_payload` resolves the chain
+  config > env > tempdir and creates the directory so events are not
+  dropped.
+- `cli.py`: `guard --reset` honors `cfg.state_dir`.
+
 ## New `[guard]` keys
 
 ```toml
@@ -95,11 +127,15 @@ workspace_root = "/home/ismail/projects/app"  # scope root; default: payload cwd
 allow_hosts    = ["127.0.0.1:8080", "localhost:5432"]  # exact host:port pairs R6 ignores
 allow_sudo     = ["/usr/bin/mytool"]          # exact absolute paths allowed as `sudo <path>`
 taint_seconds  = 300                          # R7 taint lifetime in seconds (default 300)
+state_dir      = ".vitasentrion"              # guard state/events location (default: system temp dir;
+                                              # relative paths resolve against the workspace root;
+                                              # VITASENTRION_STATE_DIR is the env fallback, config wins)
 ```
 
-All four keys are validated at load: `workspace_root` must be an
+All five keys are validated at load: `workspace_root` must be an
 absolute path, `allow_hosts` entries must be `host:port`, `allow_sudo`
-entries absolute paths, `taint_seconds` a non-negative integer.
+entries absolute paths, `taint_seconds` a non-negative integer,
+`state_dir` a non-empty string.
 Unknown `[guard]` keys are rejected as before.
 
 ## Tests
@@ -108,9 +144,12 @@ New test classes: `TestConfigWorkspaceRoot`, `TestAllowHosts`,
 `TestAllowSudo`, `TestWriteContentVsCommands`,
 `TestTaintContentAndExpiry` (guard) plus rule-engine counterparts in
 `test_models_and_rules.py` and parser/config coverage in
-`test_parsers.py` / `test_config.py`.
+`test_parsers.py` / `test_config.py`. Ported features add
+`StateDirConfigTests` (config), `StateDirGuardTests` (guard) and
+`tests/test_main.py` (`python -m vitasentrion` via subprocess: help,
+version, allow -> 0, block -> 2).
 
-Run: `python -m pytest tests/ -q` -> 460 passed, 50 subtests passed.
+Run: `python -m pytest tests/ -q` -> 484 passed, 50 subtests passed.
 
 ## Commits on `native-user`
 
@@ -119,5 +158,7 @@ Run: `python -m pytest tests/ -q` -> 460 passed, 50 subtests passed.
 - (d) R6 command checks skip written file bodies; R5 and scope unchanged
   (this commit also carries the (c) allow_sudo implementation)
 - (e,f) R7 taint content fix + taint_seconds expiry
+- (g,h) port __main__.py + [guard].state_dir / VITASENTRION_STATE_DIR
+  from the removed plugin build, with tests
 
 Not pushed (no push access from this workspace); left here for review.

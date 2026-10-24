@@ -16,6 +16,11 @@ Schema (all keys optional)::
     allow_hosts = ["127.0.0.1:8080"]  # R6 network hits ignored for these host:port
     allow_sudo = ["/usr/bin/mytool"]  # R6 blocks `sudo <path>` only outside this list
     taint_seconds = 300            # R7 taint lifetime (egress after taint)
+    state_dir = ".vitasentrion"    # where the guard state + events log live
+
+The ``VITASENTRION_STATE_DIR`` environment variable is a fallback for
+``[guard].state_dir``: when the config file does not set the key, the
+environment value is used; when both are set, the config value wins.
 
     [rules]
     R3 = "warn"                    # per-rule action: block | warn | ignore
@@ -54,6 +59,8 @@ __all__ = [
     "rule_action",
     "redaction_enabled",
     "effective_rule_severity",
+    "env_state_dir",
+    "STATE_DIR_ENV_VAR",
     "CONFIG_FILENAME",
     "RULE_IDS",
     "RULE_ACTIONS",
@@ -72,6 +79,16 @@ DEFAULT_MAX_CONSECUTIVE_EDITS = 3
 DEFAULT_STATE_TTL_SECONDS = 3600
 # R7 taint window in seconds (the M6 relay window ages out by wall clock).
 DEFAULT_TAINT_SECONDS = 300
+
+# Environment fallback for [guard].state_dir (config value wins when both
+# are set). Unset means the historical tempfile.gettempdir() default.
+STATE_DIR_ENV_VAR = "VITASENTRION_STATE_DIR"
+
+
+def env_state_dir() -> Optional[str]:
+    """The VITASENTRION_STATE_DIR value, or None when unset/empty."""
+    value = os.environ.get(STATE_DIR_ENV_VAR, "").strip()
+    return value or None
 
 
 class ConfigError(Exception):
@@ -95,6 +112,7 @@ class VitaConfig:
     allow_hosts: tuple[str, ...] = ()  # "host:port" pairs the R6 net check ignores
     allow_sudo: tuple[str, ...] = ()  # absolute paths allowed as `sudo <path>`
     taint_seconds: int = DEFAULT_TAINT_SECONDS  # R7 taint lifetime
+    state_dir: Optional[str] = None  # None -> tempfile.gettempdir()
     rule_actions: dict[str, str] = field(default_factory=dict)
     blocked_commands: tuple[str, ...] = ()
     secret_patterns: tuple[str, ...] = ()
@@ -106,8 +124,11 @@ class VitaConfig:
 
 
 def default_config() -> VitaConfig:
-    """The hardcoded pre-M8 behaviour, as a config object."""
-    return VitaConfig()
+    """The hardcoded pre-M8 behaviour, as a config object.
+
+    ``state_dir`` falls back to VITASENTRION_STATE_DIR (no config file
+    is involved, so the environment applies)."""
+    return VitaConfig(state_dir=env_state_dir())
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +226,7 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
         if section not in known_sections:
             raise ConfigError(f"unknown config section [{section}]")
 
-    cfg = VitaConfig(source=source)
+    cfg = VitaConfig(source=source, state_dir=env_state_dir())
 
     guard = data.get("guard", {})
     if not isinstance(guard, dict):
@@ -214,7 +235,7 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
         if key not in (
             "max_consecutive_edits", "state_ttl_seconds", "ignore_paths",
             "redact_secrets", "workspace_root", "allow_hosts", "allow_sudo",
-            "taint_seconds",
+            "taint_seconds", "state_dir",
         ):
             raise ConfigError(f"unknown key [guard].{key}")
     if "max_consecutive_edits" in guard:
@@ -256,6 +277,13 @@ def parse_config_dict(data: dict, source: Optional[str]) -> VitaConfig:
                 f"{taint!r}"
             )
         cfg.taint_seconds = taint
+    if "state_dir" in guard:
+        sd = guard["state_dir"]
+        if not isinstance(sd, str) or not sd.strip():
+            raise ConfigError(
+                f"[guard].state_dir must be a non-empty string, got {sd!r}"
+            )
+        cfg.state_dir = sd.strip()
 
     rules = data.get("rules", {})
     if not isinstance(rules, dict):

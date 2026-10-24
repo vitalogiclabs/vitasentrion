@@ -8,11 +8,13 @@ errors.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vitasentrion.cli import main as cli_main
 from vitasentrion.config import (
@@ -522,6 +524,68 @@ taint_seconds = 60
         self.write_config("[guard]\ntaint_seconds = true\n")
         with self.assertRaises(ConfigError):
             load_config(start_dir=self.root)
+
+
+# ---------------------------------------------------------------------------
+# [guard].state_dir + VITASENTRION_STATE_DIR fallback
+# ---------------------------------------------------------------------------
+
+class StateDirConfigTests(unittest.TestCase):
+    ENV = "VITASENTRION_STATE_DIR"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._env = mock.patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop(self.ENV, None)
+        self.addCleanup(self._env.stop)
+
+    def write_config(self, text: str, name: str = "vitasentrion.toml") -> Path:
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_state_dir_default_none(self):
+        cfg = load_config(start_dir=self.root)
+        self.assertIsNone(cfg.state_dir)
+
+    def test_state_dir_key_parsed_and_stripped(self):
+        self.write_config('[guard]\nstate_dir = " .vitasentrion "\n')
+        cfg = load_config(start_dir=self.root)
+        self.assertEqual(cfg.state_dir, ".vitasentrion")
+
+    def test_state_dir_empty_rejected(self):
+        self.write_config('[guard]\nstate_dir = "   "\n')
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_state_dir_non_string_rejected(self):
+        self.write_config("[guard]\nstate_dir = 5\n")
+        with self.assertRaises(ConfigError):
+            load_config(start_dir=self.root)
+
+    def test_env_fallback_when_key_absent(self):
+        os.environ[self.ENV] = "/srv/env-state"
+        cfg = load_config(start_dir=self.root)
+        self.assertEqual(cfg.state_dir, "/srv/env-state")
+
+    def test_config_value_wins_over_env(self):
+        os.environ[self.ENV] = "/srv/env-state"
+        self.write_config('[guard]\nstate_dir = ".vs"\n')
+        cfg = load_config(start_dir=self.root)
+        self.assertEqual(cfg.state_dir, ".vs")
+
+    def test_default_config_picks_up_env(self):
+        os.environ[self.ENV] = "/srv/env-state"
+        self.assertEqual(default_config().state_dir, "/srv/env-state")
+
+    def test_default_config_none_without_env(self):
+        self.assertIsNone(default_config().state_dir)
+
+    def test_env_var_empty_means_none(self):
+        os.environ[self.ENV] = "   "
+        self.assertIsNone(load_config(start_dir=self.root).state_dir)
 
 
 if __name__ == "__main__":

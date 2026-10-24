@@ -56,6 +56,7 @@ from .config import (
     DEFAULT_STATE_TTL_SECONDS,
     DEFAULT_TAINT_SECONDS,
     VitaConfig,
+    env_state_dir,
     path_matches_ignore,
     redaction_enabled,
     rule_action,
@@ -94,6 +95,7 @@ __all__ = [
     "STATE_TTL_SECONDS",
     "_extract_call",
     "_default_state_file",
+    "resolve_state_dir",
     "_canonical_args_json",
     "_iter_path_values",
     "_is_tainted_call",
@@ -168,15 +170,34 @@ STATE_TTL_SECONDS = 3600
 _EVENTS_MAX_BYTES = 5 * 1024 * 1024
 
 
-def _default_state_file(workspace_root: str) -> Path:
-    """Deterministic state file in the system temp dir, keyed by workspace.
+def resolve_state_dir(state_dir: str, workspace_root: str) -> Path:
+    """Normalize a configured state_dir into an absolute path.
 
-    The file lives in ``tempfile.gettempdir()`` (never inside the user's
-    repository) and is derived from a sha256 of the resolved workspace
-    root, so the same workspace maps to the same file on any machine.
+    An absolute *state_dir* is used as given; a relative one is
+    resolved against *workspace_root*.
+    """
+    expanded = os.path.expanduser(state_dir)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(os.path.normpath(workspace_root), expanded)
+    return Path(os.path.normpath(expanded))
+
+
+def _default_state_file(workspace_root: str, state_dir: Optional[str] = None) -> Path:
+    """Deterministic state file keyed by workspace.
+
+    With no *state_dir* the file lives in ``tempfile.gettempdir()``
+    (never inside the user's repository) and is derived from a sha256 of
+    the resolved workspace root, so the same workspace maps to the same
+    file on any machine.  With a *state_dir* ([guard].state_dir or
+    VITASENTRION_STATE_DIR) the file lives in that directory instead.
     """
     digest = hashlib.sha256(os.path.realpath(workspace_root).encode("utf-8")).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / f"vitasentrion-guard-{digest}.json"
+    base = (
+        resolve_state_dir(state_dir, workspace_root)
+        if state_dir
+        else Path(tempfile.gettempdir())
+    )
+    return base / f"vitasentrion-guard-{digest}.json"
 
 
 def _events_file(state_file: Path) -> Path:
@@ -371,20 +392,47 @@ def _workspace_root_for(
     return os.getcwd()
 
 
-def _scope_escape_paths(args: dict, root: str) -> list[str]:
-    """Path arguments that land outside the workspace root (R6)."""
+def _scope_escape_paths(
+    args: dict, root: str, state_dir: Optional[Path] = None
+) -> list[str]:
+    """Path arguments that land outside the workspace root (R6).
+
+    *state_dir* (resolved, when configured) is a HARD block: any write
+    into it is reported even when it sits inside the workspace or the
+    temp dir.  The scratch exception (``temp_root``) always stays the
+    real ``tempfile.gettempdir()`` — a configured state_dir never
+    widens the allowed write locations.
+    """
     root_norm = os.path.normpath(root)
     temp_root = os.path.normpath(tempfile.gettempdir())
+    state_root = os.path.normpath(str(state_dir)) if state_dir else None
     escapes: list[str] = []
 
     for path in _iter_path_values(args):
         if not path.startswith("/"):
             # Relative path: block only when '..' climbs out of the root.
             resolved = os.path.normpath(os.path.join(root_norm, path))
+            if state_root and (
+                resolved == state_root
+                or resolved.startswith(state_root + os.sep)
+            ):
+                escapes.append(
+                    f"path {path!r} writes into the guard state directory"
+                )
+                continue
             if os.path.commonpath([root_norm, resolved]) != root_norm:
                 escapes.append(
                     f"relative path {path!r} resolves outside workspace"
                 )
+            continue
+        # Absolute path inside the configured state dir: always blocked
+        # (checked BEFORE the scratch exceptions below).
+        if state_root and (
+            path == state_root or path.startswith(state_root.rstrip("/") + "/")
+        ):
+            escapes.append(
+                f"target {path!r} writes into the guard state directory"
+            )
             continue
         # Absolute path: allowed inside the root or in scratch space.
         if path == root or path.startswith(root_norm.rstrip("/") + "/"):
@@ -421,7 +469,11 @@ def _apply_rule_action(
 
 
 def _evaluate_one(
-    name: str, args: dict, root: str, config: Optional[VitaConfig] = None
+    name: str,
+    args: dict,
+    root: str,
+    config: Optional[VitaConfig] = None,
+    state_dir: Optional[Path] = None,
 ) -> tuple[bool, str, list[Finding]]:
     """Run the R4 / R5 / R6 checks for one normalised call.
 
@@ -543,7 +595,8 @@ def _evaluate_one(
         r6_details.append(f"tool '{name}' touches {SSH_ID_RSA_MARKER!r}")
 
     r6_details.extend(
-        f"tool '{name}' writes {what}" for what in _scope_escape_paths(args, root)
+        f"tool '{name}' writes {what}"
+        for what in _scope_escape_paths(args, root, state_dir)
     )
 
     if r6_details:
@@ -752,6 +805,10 @@ def _append_event(
     }
     events = _events_file(state_file)
     try:
+        # The configured state_dir may not exist yet (the state file's
+        # mkdir in _save_state runs later); create it so the first
+        # events are not silently dropped.
+        events.parent.mkdir(parents=True, exist_ok=True)
         # Best-effort rotation so an always-on hook cannot fill the disk:
         # once the log outgrows _EVENTS_MAX_BYTES, the oldest copy is kept
         # as "<log>.1" and a fresh log starts.  The audit tail is still
@@ -814,7 +871,20 @@ def evaluate_hook_payload(
 
     name, args = _extract_call(payload)
     root = _workspace_root_for(payload, workspace_root, config)
-    sf = Path(state_file) if state_file else _default_state_file(root)
+    # state_dir resolution order: [guard].state_dir (config) wins over
+    # VITASENTRION_STATE_DIR; with no config object at all the env var
+    # still applies.  Unset -> tempfile.gettempdir() (historical default).
+    configured_state_dir = (
+        config.state_dir if config is not None else env_state_dir()
+    )
+    resolved_state_dir = (
+        resolve_state_dir(configured_state_dir, root)
+        if configured_state_dir
+        else None
+    )
+    sf = Path(state_file) if state_file else _default_state_file(
+        root, configured_state_dir
+    )
 
     # --- [guard].ignore_paths: skip checks, still log the event (M8) -----
     if config is not None and config.ignore_paths:
@@ -830,7 +900,9 @@ def evaluate_hook_payload(
             return True, "Allowed (ignored path)", []
 
     # --- R4 / R5 / R6 checks ----------------------------------------------
-    allowed, reason, findings = _evaluate_one(name, args, root, config)
+    allowed, reason, findings = _evaluate_one(
+        name, args, root, config, resolved_state_dir
+    )
 
     # Record the evaluated event as ground-truth JSONL (M4.5 A4).
     _append_event(

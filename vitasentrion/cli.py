@@ -154,7 +154,9 @@ def cmd_guard(args) -> int:
         ws_root = Path.cwd()
 
     if args.reset:
-        sf = state_path if state_path else _default_state_file(str(ws_root))
+        sf = state_path if state_path else _default_state_file(
+            str(ws_root), cfg.state_dir
+        )
         removed = reset_state(sf)
         print(f"VitaSentrion: loop-breaker state {'reset' if removed else 'not present'} ({sf})")
         return 0

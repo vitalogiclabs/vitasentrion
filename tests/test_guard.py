@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import vitasentrion.guard as guard
 from vitasentrion.config import VitaConfig
@@ -30,6 +31,7 @@ from vitasentrion.guard import (
     _iter_path_values,
     evaluate_hook_payload,
     reset_state,
+    resolve_state_dir,
     verify_events_chain,
 )
 from vitasentrion.models import Finding, Severity
@@ -1243,6 +1245,176 @@ class TestEventsRotation(GuardBase):
         from vitasentrion.parsers import parse_trace
         trace = parse_trace(str(ev))
         self.assertGreaterEqual(len(trace.tool_events), 1)
+
+
+# ---------------------------------------------------------------------------
+# [guard].state_dir / VITASENTRION_STATE_DIR
+# ---------------------------------------------------------------------------
+
+class StateDirGuardTests(unittest.TestCase):
+    """state_dir moves the guard state + events files out of the temp dir."""
+
+    ENV = "VITASENTRION_STATE_DIR"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="vs-statedir-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "project"
+        self.root.mkdir()
+        self._env = mock.patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop(self.ENV, None)
+        self.addCleanup(self._env.stop)
+
+    # -- resolve_state_dir ---------------------------------------------------
+
+    def test_resolve_absolute_state_dir_used_as_given(self):
+        self.assertEqual(
+            resolve_state_dir("/srv/vs", "/home/dev/app"), Path("/srv/vs")
+        )
+
+    def test_resolve_relative_state_dir_against_workspace(self):
+        self.assertEqual(
+            resolve_state_dir(".vs", "/home/dev/app"), Path("/home/dev/app/.vs")
+        )
+        self.assertEqual(
+            resolve_state_dir("./.vs/../.vs", "/home/dev/app"),
+            Path("/home/dev/app/.vs"),
+        )
+
+    def test_resolve_state_dir_expands_user(self):
+        with mock.patch.dict(os.environ, {"HOME": "/home/dev"}):
+            self.assertEqual(
+                resolve_state_dir("~/.vs", "/home/dev/app"),
+                Path("/home/dev/.vs"),
+            )
+
+    # -- default state file location -----------------------------------------
+
+    def test_default_state_file_honors_state_dir(self):
+        sf = _default_state_file("/home/dev/app", "/srv/vs")
+        self.assertEqual(sf.parent, Path("/srv/vs"))
+        # still keyed by workspace root:
+        self.assertNotEqual(
+            sf, _default_state_file("/home/dev/other", "/srv/vs")
+        )
+
+    def test_default_state_file_without_state_dir_unchanged(self):
+        sf = _default_state_file("/home/dev/app")
+        self.assertEqual(sf.parent, Path(tempfile.gettempdir()))
+
+    # -- evaluate_hook_payload wiring ----------------------------------------
+
+    @staticmethod
+    def _names(d: Path) -> set:
+        return {p.name for p in d.iterdir()}
+
+    def test_config_state_dir_moves_state_and_events(self):
+        cfg = VitaConfig(state_dir=".vs")  # relative -> inside the workspace
+        allowed, _, _ = evaluate_hook_payload(
+            generic_payload("terminal", command="echo hi"),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertTrue(allowed)
+        vs = self.root / ".vs"  # created on demand
+        self.assertTrue(vs.is_dir())
+        names = self._names(vs)
+        self.assertTrue(
+            any(
+                n.startswith("vitasentrion-guard-") and n.endswith(".json")
+                for n in names
+            )
+        )
+        self.assertTrue(any(n.endswith(".events.jsonl") for n in names))
+
+    def test_env_fallback_without_config_object(self):
+        env_dir = self.root / "envstate"
+        os.environ[self.ENV] = str(env_dir)
+        allowed, _, _ = evaluate_hook_payload(
+            generic_payload("terminal", command="echo hi"),
+            workspace_root=str(self.root),
+        )
+        self.assertTrue(allowed)
+        self.assertTrue(env_dir.is_dir())
+        self.assertTrue(
+            any(
+                n.endswith(".events.jsonl")
+                for n in self._names(env_dir)
+            )
+        )
+
+    def test_config_wins_over_env(self):
+        env_dir = self.root / "envstate"
+        cfg_dir = self.root / "cfgstate"
+        os.environ[self.ENV] = str(env_dir)
+        cfg = VitaConfig(state_dir=str(cfg_dir))
+        evaluate_hook_payload(
+            generic_payload("terminal", command="echo hi"),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertTrue(cfg_dir.is_dir())
+        self.assertFalse(env_dir.exists())
+
+    # -- hard block: writes into the state directory --------------------------
+
+    def test_absolute_write_into_state_dir_blocked_inside_workspace(self):
+        # Even though the state dir sits INSIDE the workspace (normally an
+        # allowed write location), writing into it is a hard R6 block.
+        cfg = VitaConfig(state_dir=".vs")
+        vs = self.root / ".vs"
+        vs.mkdir()
+        allowed, _, findings = evaluate_hook_payload(
+            generic_payload(
+                "write_file", path=str(vs / "state.json"), content="x"
+            ),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_relative_write_into_state_dir_blocked(self):
+        cfg = VitaConfig(state_dir=".vs")
+        allowed, _, findings = evaluate_hook_payload(
+            generic_payload(
+                "write_file", path=".vs/state.json", content="x"
+            ),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+
+    def test_state_dir_in_tempdir_blocks_writes_there_only(self):
+        # A state_dir inside the scratch space does not get the scratch
+        # exception: writes into it are blocked, writes elsewhere in the
+        # temp dir stay allowed.
+        sd = Path(tempfile.gettempdir()) / "vs-statedir-guard"
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(sd, ignore_errors=True)
+        )
+        cfg = VitaConfig(state_dir=str(sd))
+        allowed, _, findings = evaluate_hook_payload(
+            generic_payload(
+                "write_file", path=str(sd / "x.json"), content="x"
+            ),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("R6", rule_ids(findings))
+        allowed2, _, findings2 = evaluate_hook_payload(
+            generic_payload(
+                "write_file",
+                path=str(sd.parent / "vs-scratch-ok.txt"),
+                content="x",
+            ),
+            workspace_root=str(self.root),
+            config=cfg,
+        )
+        self.assertTrue(allowed2, findings2)
 
 
 if __name__ == "__main__":
